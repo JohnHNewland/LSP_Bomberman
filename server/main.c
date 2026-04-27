@@ -12,6 +12,7 @@
 #include <sys/select.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <ncurses.h>
 
 #define DEFAULT_HOST "127.0.0.1"
@@ -22,6 +23,13 @@
 #define MAX_PLAYERS 8
 #define TICKS_PER_SECOND 20
 #define MAX_NAME_LEN 15
+
+#define LOG_LINES 16
+#define LOG_LINE_LEN 96
+
+#define CLIENT_ID_LEN 20
+#define PLAYER_NAME_LEN 30
+#define HEADER_LEN 3
 
 typedef enum {
     GAME_LOBBY = 0,
@@ -90,7 +98,6 @@ typedef struct {
     uint16_t timer_ticks;
 } bomb_t;
 
-// Helper functions from config.h logic
 static inline uint16_t make_cell_index(uint16_t row, uint16_t col, uint16_t cols) {
     return (uint16_t)(row * cols + col);
 }
@@ -99,9 +106,6 @@ static inline void split_cell_index(uint16_t index, uint16_t cols, uint16_t *row
     *row = (uint16_t)(index / cols);
     *col = (uint16_t)(index % cols);
 }
-
-/* Main Server Implementation */
-
 
 typedef struct {
     int fd;
@@ -113,6 +117,33 @@ static client_t clients[MAX_CLIENTS];
 static int active_clients_count = 0;
 static volatile sig_atomic_t running = 1;
 static game_status_t current_game_state = GAME_LOBBY;
+
+static char log_buf[LOG_LINES][LOG_LINE_LEN];
+static int log_count = 0;
+
+static void log_msg(const char *fmt, ...) {
+    va_list ap;
+    int slot = log_count % LOG_LINES;
+    va_start(ap, fmt);
+    vsnprintf(log_buf[slot], LOG_LINE_LEN, fmt, ap);
+    va_end(ap);
+    log_count++;
+}
+
+static int send_error(int fd, uint8_t target_id, const char *err) {
+    uint8_t buf[256];
+    size_t max_payload = sizeof(buf) - HEADER_LEN - 2;
+    size_t err_len = strlen(err);
+    if (err_len > max_payload) err_len = max_payload;
+    buf[0] = MSG_ERROR;
+    buf[1] = 0xFF;
+    buf[2] = target_id;
+    buf[3] = (uint8_t)((err_len >> 8) & 0xFF);
+    buf[4] = (uint8_t)(err_len & 0xFF);
+    memcpy(buf + HEADER_LEN + 2, err, err_len);
+    size_t total = HEADER_LEN + 2 + err_len;
+    return (write(fd, buf, total) == (ssize_t)total) ? 0 : -1;
+}
 
 void cleanup(int sig) {
     (void)sig;
@@ -145,73 +176,91 @@ void reset_client_data(int index) {
     memset(&clients[index].p, 0, sizeof(player_t));
 }
 
-int process_message(int client_fd, char *buffer, ssize_t len) {
-    if (len <= 0) return -1; 
-    
-    // Ensure buffer is null-terminated if it contains text, though we parse binary mostly
-    // For MSG_HELLO, we expect a string payload.
-    
+int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
+    if (len <= 0) return -1;
     if (len < 1) return -1;
 
+    int cn = client_idx + 1;
     msg_type_t type = buffer[0];
-    
+
     switch (type) {
         case MSG_HELLO: {
-            // Payload is expected to be the player name and other fields.
-            // Assuming the client sends "NAME" then struct data if needed, 
-            // or just a simple string for this skeleton.
-            
-            // Copy name directly from buffer + 1 (skipping msg_type byte)
-            // Ensure we don't overflow
-            size_t name_len = len - 1;
-            if (name_len > MAX_NAME_LEN) name_len = MAX_NAME_LEN;
-            
-            memcpy(clients[active_clients_count].p.name, buffer + 1, name_len);
-            clients[active_clients_count].p.id = active_clients_count; 
-            // Mark as alive by default until logic says otherwise
-            clients[active_clients_count].p.alive = true;
-            
-            // Send Welcome response
+            if (len < HEADER_LEN + CLIENT_ID_LEN + PLAYER_NAME_LEN) {
+                send_error(client_fd, 0xFF, "Malformed HELLO");
+                log_msg("C%d <- ERROR (malformed HELLO)", cn);
+                return 0;
+            }
+            char client_id[CLIENT_ID_LEN + 1] = {0};
+            char player_name[PLAYER_NAME_LEN + 1] = {0};
+            memcpy(client_id, buffer + HEADER_LEN, CLIENT_ID_LEN);
+            memcpy(player_name, buffer + HEADER_LEN + CLIENT_ID_LEN, PLAYER_NAME_LEN);
+
+            snprintf(clients[client_idx].p.name, MAX_NAME_LEN + 1, "%s", player_name);
+            clients[client_idx].p.id = client_idx;
+            clients[client_idx].p.alive = true;
+
+            log_msg("C%d -> HELLO (id=%s, name=%s)", cn, client_id, clients[client_idx].p.name);
+
             char welcome_buf[256];
-            snprintf(welcome_buf, sizeof(welcome_buf), "Welcome %s to Bomberman!", clients[active_clients_count].p.name);
+            snprintf(welcome_buf, sizeof(welcome_buf), "Welcome %s to Bomberman!", clients[client_idx].p.name);
             write(client_fd, welcome_buf, strlen(welcome_buf));
+            log_msg("C%d <- WELCOME", cn);
             return 0;
         }
-        
+
         case MSG_PING: {
+            log_msg("C%d -> PING", cn);
             char pong_buf[256];
             snprintf(pong_buf, sizeof(pong_buf), "PONG");
             write(client_fd, pong_buf, strlen(pong_buf));
+            log_msg("C%d <- PONG", cn);
+            return 0;
+        }
+
+        case MSG_LEAVE: {
+            log_msg("C%d -> LEAVE", cn);
+            return 0;
+        }
+
+        case MSG_SET_READY: {
+            log_msg("C%d -> SET_READY", cn);
+            clients[client_idx].p.ready = true;
             return 0;
         }
 
         case MSG_MOVE_ATTEMPT: {
-            // Acknowledge move attempt or send new state
+            log_msg("C%d -> MOVE_ATTEMPT", cn);
             char ack[64];
-            snprintf(ack, sizeof(ack), "MSG_MOVED"); 
+            snprintf(ack, sizeof(ack), "MSG_MOVED");
             write(client_fd, ack, strlen(ack));
+            log_msg("C%d <- MOVED", cn);
             return 0;
         }
 
         case MSG_BOMB_ATTEMPT: {
-             char ack[64];
-             snprintf(ack, sizeof(ack), "MSG_BOMB");
-             write(client_fd, ack, strlen(ack));
-             return 0;
+            log_msg("C%d -> BOMB_ATTEMPT", cn);
+            char ack[64];
+            snprintf(ack, sizeof(ack), "MSG_BOMB");
+            write(client_fd, ack, strlen(ack));
+            log_msg("C%d <- BOMB", cn);
+            return 0;
         }
 
         case MSG_SYNC_REQUEST: {
-            // Handle board sync request
+            log_msg("C%d -> SYNC_REQUEST", cn);
             if (current_game_state == GAME_RUNNING) {
-                // Serialize board state here
-                char sync_buf[1024]; 
-                snprintf(sync_buf, sizeof(sync_buf), "SYNC_BOARD_DATA"); 
+                char sync_buf[1024];
+                snprintf(sync_buf, sizeof(sync_buf), "SYNC_BOARD_DATA");
                 write(client_fd, sync_buf, strlen(sync_buf));
+                log_msg("C%d <- SYNC_BOARD", cn);
+            } else {
+                log_msg("C%d <- (sync ignored: not running)", cn);
             }
             return 0;
         }
 
         default:
+            log_msg("C%d -> unknown (type=%d)", cn, (int)type);
             break;
     }
     return 0;
@@ -219,7 +268,8 @@ int process_message(int client_fd, char *buffer, ssize_t len) {
 
 void draw_ui() {
     int y = 1, x = 1;
-    
+
+    erase();
     mvaddstr(y++, x, "=== Bomberman Server Status ===");
     mvaddstr(y++, x, "State: ");
     
@@ -247,9 +297,17 @@ void draw_ui() {
         }
     }
 
-    addstr("\nControls:\n");
-    addstr("  [q] Quit Server\n");
-    
+    y++;
+    mvaddstr(y++, x, "Controls:");
+    mvaddstr(y++, x, "  [q] Quit Server");
+
+    y++;
+    mvaddstr(y++, x, "=== Logs ===");
+    int log_start = (log_count > LOG_LINES) ? (log_count - LOG_LINES) : 0;
+    for (int i = log_start; i < log_count; i++) {
+        mvprintw(y++, x, "  %s", log_buf[i % LOG_LINES]);
+    }
+
     refresh();
 }
 
@@ -356,15 +414,18 @@ int main(int argc, char *argv[]) {
                 if (active_clients_count < MAX_CLIENTS) {
                     reset_client_data(active_clients_count);
                     clients[active_clients_count].fd = new_sock;
-                    
+
                     // Send initial request to identify client
                     char hello_req[64];
                     snprintf(hello_req, sizeof(hello_req), "HELLO_REQ");
                     write(new_sock, hello_req, strlen(hello_req));
 
                     active_clients_count++;
+                    log_msg("Client %d connected.", active_clients_count);
+                    log_msg("C%d <- HELLO_REQ", active_clients_count);
                 } else {
-                    close(new_sock); 
+                    close(new_sock);
+                    log_msg("Connection refused: server full.");
                 }
             }
         }
@@ -379,11 +440,10 @@ int main(int argc, char *argv[]) {
                 ssize_t bytes_read = read(sock, buffer, sizeof(buffer) - 1);
                 
                 if (bytes_read > 0) {
-                    process_message(sock, buffer, bytes_read);
+                    process_message(i, sock, buffer, bytes_read);
                 } else if (bytes_read == 0) {
                     // Client disconnected gracefully
-                    printf("Client %d disconnected.\n", i + 1);
-                    
+                    log_msg("Client %d disconnected.", i + 1);
                     // Remove from array (shift elements left)
                     int j = i;
                     while (j < active_clients_count - 1) {
@@ -394,6 +454,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 } else {
                     // Error reading (broken pipe, etc.)
+                    log_msg("Client %d connection error.", i + 1);
                     close(sock);
                     clients[i].fd = -1;
                     // Logic to handle disconnect in next iteration or immediate removal?
