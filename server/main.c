@@ -267,6 +267,9 @@ int main(int argc, char *argv[]) {
             host = argv[1];       // no port specified, use default
         }
     }
+    else if (argc == 1) {
+        // uses default values, continue
+    }
     else {
         printf("Wrong server IP. Use ./server_bbm IP:PORT");
         exit(1);
