@@ -20,7 +20,8 @@ typedef enum {
     CELL_BONUS_SPEED,
     CELL_BONUS_RADIUS,
     CELL_BONUS_TIMER,
-    CELL_BONUS_BOMBS
+    CELL_BONUS_BOMBS,
+    CELL_EXPLOSION
 } cell_type_t;
 
 typedef struct {

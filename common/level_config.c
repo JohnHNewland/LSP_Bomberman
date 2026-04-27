@@ -21,6 +21,7 @@ char level_cell_char(const cell_t *cell) {
         case CELL_BONUS_RADIUS: return 'R';
         case CELL_BONUS_TIMER:  return 'T';
         case CELL_BONUS_BOMBS:  return 'N';
+        case CELL_EXPLOSION:    return '*';
     }
     return '?';
 }
