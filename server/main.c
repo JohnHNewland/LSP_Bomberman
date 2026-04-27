@@ -10,6 +10,8 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/select.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -18,7 +20,7 @@
 #include "../common/level_config.h"
 #include "../common/protocol.h"
 
-#define DEFAULT_HOST "127.0.0.1"
+#define DEFAULT_HOST "0.0.0.0"
 #define DEFAULT_PORT 7890
 #define BUFFER_SIZE 8192
 #define MAX_CLIENTS 16
@@ -84,6 +86,21 @@ static int send_set_status(int fd, uint8_t target_id, uint8_t game_status) {
     return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
 }
 
+static int broadcast_moved(uint8_t player_id, uint16_t coord) {
+    msg_moved_t m = {0};
+    m.hdr.msg_type  = MSG_MOVED;
+    m.hdr.sender_id = player_id;
+    m.hdr.target_id = ID_BROADCAST;
+    m.player_id     = player_id;
+    m.coord         = htons(coord);
+    int sent = 0;
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd == -1) continue;
+        if (write(clients[i].fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) sent++;
+    }
+    return sent;
+}
+
 static int broadcast_simple(uint8_t type, uint8_t sender_id) {
     int sent = 0;
     for (int i = 0; i < active_clients_count; i++) {
@@ -107,7 +124,7 @@ static int broadcast_set_status(uint8_t game_status) {
 
 static void check_match_start(void) {
     if (current_game_state != GAME_LOBBY) return;
-    if (active_clients_count < 1) return;
+    if (active_clients_count == 0) return;
     int ready_count = 0;
     for (int i = 0; i < active_clients_count; i++) {
         if (clients[i].fd != -1 && clients[i].p.ready) ready_count++;
@@ -381,7 +398,67 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
         }
 
         case MSG_MOVE_ATTEMPT: {
-            log_msg("C%d -> MOVE_ATTEMPT", cn);
+            if (len < (ssize_t)sizeof(msg_move_attempt_t)) {
+                send_error(client_fd, clients[client_idx].p.id,
+                           "Bad MOVE_ATTEMPT");
+                return 0;
+            }
+            if (current_game_state != GAME_RUNNING || !level_cfg_loaded) {
+                send_error(client_fd, clients[client_idx].p.id,
+                           "Game not running");
+                return 0;
+            }
+            const msg_move_attempt_t *ma =
+                (const msg_move_attempt_t *)buffer;
+            int dr = 0, dc = 0;
+            switch ((char)ma->direction) {
+                case DIR_UP:    dr = -1; break;
+                case DIR_DOWN:  dr =  1; break;
+                case DIR_LEFT:  dc = -1; break;
+                case DIR_RIGHT: dc =  1; break;
+                default:
+                    send_error(client_fd, clients[client_idx].p.id,
+                               "Bad direction");
+                    return 0;
+            }
+            int nr = (int)clients[client_idx].p.row + dr;
+            int nc = (int)clients[client_idx].p.col + dc;
+            if (nr < 0 || nr >= level_cfg.rows ||
+                nc < 0 || nc >= level_cfg.cols) {
+                send_error(client_fd, clients[client_idx].p.id,
+                           "Out of bounds");
+                return 0;
+            }
+            cell_t *target = level_cell_at(&level_cfg, nr, nc);
+            if (target->type == CELL_HARD_BLOCK ||
+                target->type == CELL_SOFT_BLOCK ||
+                target->type == CELL_BOMB) {
+                send_error(client_fd, clients[client_idx].p.id, "Blocked");
+                return 0;
+            }
+            for (int i = 0; i < active_clients_count; i++) {
+                if (i == client_idx) continue;
+                if (clients[i].fd == -1 || !clients[i].p.alive) continue;
+                if (clients[i].p.row == (uint16_t)nr &&
+                    clients[i].p.col == (uint16_t)nc) {
+                    send_error(client_fd, clients[client_idx].p.id,
+                               "Player there");
+                    return 0;
+                }
+            }
+            clients[client_idx].p.row = (uint16_t)nr;
+            clients[client_idx].p.col = (uint16_t)nc;
+            if (target->type == CELL_BONUS_SPEED ||
+                target->type == CELL_BONUS_RADIUS ||
+                target->type == CELL_BONUS_TIMER ||
+                target->type == CELL_BONUS_BOMBS) {
+                target->type = CELL_EMPTY;
+                target->player_id = 0;
+            }
+            uint16_t coord =
+                (uint16_t)(nr * level_cfg.cols + nc);
+            broadcast_moved(clients[client_idx].p.id, coord);
+            log_msg("C%d MOVED to (%d,%d)", cn, nr, nc);
             return 0;
         }
 
@@ -514,8 +591,24 @@ int main(int argc, char *argv[]) {
         perror("listen"); return 1;
     }
 
-    printf("Bomberman Server listening on %s:%d\n", host, port);
-    printf("Config: MaxPlayers=%d, TickRate=%dHz\n", MAX_PLAYERS, TICKS_PER_SECOND);
+    log_msg("Listening on %s:%d (port %d)", host, port, port);
+    if (strcmp(host, "0.0.0.0") == 0 || strcmp(host, "::") == 0) {
+        struct ifaddrs *ifa = NULL;
+        if (getifaddrs(&ifa) == 0) {
+            for (struct ifaddrs *p = ifa; p != NULL; p = p->ifa_next) {
+                if (!p->ifa_addr) continue;
+                if (p->ifa_addr->sa_family != AF_INET) continue;
+                char ip[INET_ADDRSTRLEN] = {0};
+                struct sockaddr_in *sin =
+                    (struct sockaddr_in *)p->ifa_addr;
+                inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+                log_msg("  %s -> %s:%d", p->ifa_name, ip, port);
+            }
+            freeifaddrs(ifa);
+        }
+        log_msg("Forward TCP port %d on your router for internet play.",
+                port);
+    }
 
     while (running) {
         draw_ui();
