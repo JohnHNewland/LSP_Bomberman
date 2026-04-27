@@ -15,97 +15,18 @@
 #include <stdarg.h>
 #include <ncurses.h>
 
+#include "../common/level_config.h"
+#include "../common/protocol.h"
+
 #define DEFAULT_HOST "127.0.0.1"
 #define DEFAULT_PORT 7890
-#define BUFFER_SIZE 256 
-#define MAX_CLIENTS 16 
-
-#define MAX_PLAYERS 8
-#define TICKS_PER_SECOND 20
-#define MAX_NAME_LEN 15
+#define BUFFER_SIZE 8192
+#define MAX_CLIENTS 16
 
 #define LOG_LINES 16
 #define LOG_LINE_LEN 96
 
-#define CLIENT_ID_LEN 20
-#define PLAYER_NAME_LEN 30
-#define HEADER_LEN 3
-
-typedef enum {
-    GAME_LOBBY = 0,
-    GAME_RUNNING = 1,
-    GAME_END = 2
-} game_status_t;
-
-typedef enum {
-    DIR_UP = 0,
-    DIR_DOWN = 1,
-    DIR_LEFT = 2,
-    DIR_RIGHT = 3
-} direction_t;
-
-typedef enum {
-    BONUS_NONE = 0,
-    BONUS_SPEED = 1,
-    BONUS_RADIUS = 2,
-    BONUS_TIMER = 3
-} bonus_type_t;
-
-typedef enum {
-    MSG_HELLO = 0,
-    MSG_WELCOME = 1,
-    MSG_DISCONNECT = 2,
-    MSG_PING = 3,
-    MSG_PONG = 4,
-    MSG_LEAVE = 5,
-    MSG_ERROR = 6,
-    MSG_SET_READY = 10,
-    MSG_SET_STATUS = 20,
-    MSG_WINNER = 23,
-    MSG_MOVE_ATTEMPT = 30,
-    MSG_BOMB_ATTEMPT = 31,
-    MSG_MOVED = 40,
-    MSG_BOMB = 41,
-    MSG_EXPLOSION_START = 42,
-    MSG_EXPLOSION_END = 43,
-    MSG_DEATH = 44,
-    MSG_BONUS_AVAILABLE = 45,
-    MSG_BONUS_RETRIEVED = 46,
-    MSG_BLOCK_DESTROYED = 47,
-    MSG_SYNC_BOARD = 100,
-    MSG_SYNC_REQUEST = 101
-} msg_type_t;
-
-typedef struct {
-    uint8_t id;
-    uint8_t lives; 
-    char name[MAX_NAME_LEN + 1];
-    uint16_t row;
-    uint16_t col;
-    bool alive;
-    bool ready;
-    uint8_t bomb_count;
-    uint8_t bomb_radius;
-    uint16_t bomb_timer_ticks;
-    uint16_t speed;
-} player_t;
-
-typedef struct {
-    uint8_t owner_id;
-    uint16_t row;
-    uint16_t col;
-    uint8_t radius;
-    uint16_t timer_ticks;
-} bomb_t;
-
-static inline uint16_t make_cell_index(uint16_t row, uint16_t col, uint16_t cols) {
-    return (uint16_t)(row * cols + col);
-}
-
-static inline void split_cell_index(uint16_t index, uint16_t cols, uint16_t *row, uint16_t *col) {
-    *row = (uint16_t)(index / cols);
-    *col = (uint16_t)(index % cols);
-}
+#define SERVER_ID_STR "bbm-server-0.1"
 
 typedef struct {
     int fd;
@@ -117,6 +38,9 @@ static client_t clients[MAX_CLIENTS];
 static int active_clients_count = 0;
 static volatile sig_atomic_t running = 1;
 static game_status_t current_game_state = GAME_LOBBY;
+
+static level_config_t level_cfg = {0};
+static bool level_cfg_loaded = false;
 
 static char log_buf[LOG_LINES][LOG_LINE_LEN];
 static int log_count = 0;
@@ -135,14 +59,94 @@ static int send_error(int fd, uint8_t target_id, const char *err) {
     size_t max_payload = sizeof(buf) - HEADER_LEN - 2;
     size_t err_len = strlen(err);
     if (err_len > max_payload) err_len = max_payload;
-    buf[0] = MSG_ERROR;
-    buf[1] = 0xFF;
-    buf[2] = target_id;
-    buf[3] = (uint8_t)((err_len >> 8) & 0xFF);
-    buf[4] = (uint8_t)(err_len & 0xFF);
+    msg_generic_t hdr = { MSG_ERROR, ID_SERVER, target_id };
+    memcpy(buf, &hdr, sizeof(hdr));
+    buf[HEADER_LEN]     = (uint8_t)((err_len >> 8) & 0xFF);
+    buf[HEADER_LEN + 1] = (uint8_t)(err_len & 0xFF);
     memcpy(buf + HEADER_LEN + 2, err, err_len);
     size_t total = HEADER_LEN + 2 + err_len;
     return (write(fd, buf, total) == (ssize_t)total) ? 0 : -1;
+}
+
+static int send_map_to(int fd, uint8_t target_id);
+
+static int send_simple(int fd, uint8_t type, uint8_t target_id) {
+    msg_generic_t m = { type, ID_SERVER, target_id };
+    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
+static int send_set_status(int fd, uint8_t target_id, uint8_t game_status) {
+    msg_set_status_t m = {0};
+    m.hdr.msg_type  = MSG_SET_STATUS;
+    m.hdr.sender_id = ID_SERVER;
+    m.hdr.target_id = target_id;
+    m.game_status   = game_status;
+    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
+static int broadcast_simple(uint8_t type, uint8_t sender_id) {
+    int sent = 0;
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd == -1) continue;
+        msg_generic_t m = { type, sender_id, ID_BROADCAST };
+        if (write(clients[i].fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) sent++;
+    }
+    return sent;
+}
+
+static int broadcast_set_status(uint8_t game_status) {
+    int sent = 0;
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd == -1) continue;
+        if (send_set_status(clients[i].fd, ID_BROADCAST, game_status) == 0) {
+            sent++;
+        }
+    }
+    return sent;
+}
+
+static void check_match_start(void) {
+    if (current_game_state != GAME_LOBBY) return;
+    if (active_clients_count < 1) return;
+    int ready_count = 0;
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd != -1 && clients[i].p.ready) ready_count++;
+    }
+    if (ready_count != active_clients_count) return;
+
+    current_game_state = GAME_RUNNING;
+    broadcast_set_status(GAME_RUNNING);
+    log_msg("All %d player(s) ready - match started.", ready_count);
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd == -1) continue;
+        if (level_cfg_loaded) send_map_to(clients[i].fd, clients[i].p.id);
+    }
+}
+
+static int send_welcome(int fd, uint8_t to_id) {
+    msg_welcome_t w = {0};
+    w.hdr.msg_type  = MSG_WELCOME;
+    w.hdr.sender_id = to_id;
+    w.hdr.target_id = to_id;
+    snprintf(w.server_id, sizeof(w.server_id), "%s", SERVER_ID_STR);
+    w.game_status = (uint8_t)current_game_state;
+
+    uint8_t buf[sizeof(w) + MAX_PLAYERS * sizeof(msg_other_client_t)];
+    size_t off = sizeof(w);
+    uint8_t count = 0;
+    for (int i = 0; i < active_clients_count && count < MAX_PLAYERS; i++) {
+        if (clients[i].fd == -1 || clients[i].p.id == to_id) continue;
+        msg_other_client_t oc = {0};
+        oc.id = clients[i].p.id;
+        oc.ready = clients[i].p.ready ? 1 : 0;
+        snprintf(oc.name, sizeof(oc.name), "%s", clients[i].p.name);
+        memcpy(buf + off, &oc, sizeof(oc));
+        off += sizeof(oc);
+        count++;
+    }
+    w.length = count;
+    memcpy(buf, &w, sizeof(w));
+    return (write(fd, buf, off) == (ssize_t)off) ? 0 : -1;
 }
 
 void cleanup(int sig) {
@@ -156,8 +160,146 @@ void cleanup(int sig) {
         }
     }
     if (server_fd != -1) close(server_fd);
+    level_config_free(&level_cfg);
     endwin();
     exit(0);
+}
+
+static int send_map_to(int fd, uint8_t target_id) {
+    if (!level_cfg_loaded) return 0;
+    size_t cells = (size_t)level_cfg.rows * level_cfg.cols;
+    size_t total = sizeof(msg_map_t) + cells;
+    uint8_t *buf = (uint8_t *)malloc(total);
+    if (!buf) return -1;
+    msg_map_t m = {0};
+    m.hdr.msg_type  = MSG_MAP;
+    m.hdr.sender_id = ID_SERVER;
+    m.hdr.target_id = target_id;
+    m.H = level_cfg.rows;
+    m.W = level_cfg.cols;
+    memcpy(buf, &m, sizeof(m));
+    for (size_t i = 0; i < cells; i++) {
+        buf[sizeof(m) + i] = (uint8_t)level_cell_char(&level_cfg.cells[i]);
+    }
+    ssize_t w = write(fd, buf, total);
+    free(buf);
+    return (w == (ssize_t)total) ? 0 : -1;
+}
+
+static void broadcast_map(void) {
+    if (!level_cfg_loaded) return;
+    int sent = 0;
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd == -1) continue;
+        if (send_map_to(clients[i].fd, 0xFE) == 0) sent++;
+    }
+    log_msg("MAP broadcast to %d client(s)", sent);
+}
+
+static void assign_player_starts(void) {
+    if (!level_cfg_loaded) return;
+
+    /* indexed 1..8: cell linear index + 1 (0 means slot empty) */
+    int starts[LEVEL_MAX_PLAYERS + 1] = {0};
+    for (int r = 0; r < level_cfg.rows; r++) {
+        for (int c = 0; c < level_cfg.cols; c++) {
+            cell_t *cell = level_cell_at(&level_cfg, r, c);
+            if (cell->type == CELL_PLAYER_START &&
+                cell->player_id >= 1 &&
+                cell->player_id <= LEVEL_MAX_PLAYERS) {
+                starts[cell->player_id] = r * level_cfg.cols + c + 1;
+            }
+        }
+    }
+
+    int next_slot = 1;
+    for (int i = 0; i < active_clients_count; i++) {
+        while (next_slot <= LEVEL_MAX_PLAYERS && starts[next_slot] == 0) {
+            next_slot++;
+        }
+        if (next_slot > LEVEL_MAX_PLAYERS) {
+            log_msg("No start position for client %d", i + 1);
+            break;
+        }
+        int idx = starts[next_slot] - 1;
+        clients[i].p.id = (uint8_t)next_slot;
+        clients[i].p.row = (uint16_t)(idx / level_cfg.cols);
+        clients[i].p.col = (uint16_t)(idx % level_cfg.cols);
+        clients[i].p.alive = true;
+        log_msg("Player %d -> start %d at (%u,%u)",
+                i + 1, next_slot,
+                clients[i].p.row, clients[i].p.col);
+        next_slot++;
+    }
+}
+
+static void load_level_dialog(void) {
+    log_msg("Opening level picker...");
+
+    level_entry_t entries[LEVEL_LIST_MAX];
+    int n = level_list_dir(LEVEL_DIR, entries, LEVEL_LIST_MAX);
+    if (n < 0) {
+        log_msg("Cannot open '%s/' (cwd issue?)", LEVEL_DIR);
+        return;
+    }
+    if (n == 0) {
+        log_msg("No .map files found in '%s/'.", LEVEL_DIR);
+        return;
+    }
+
+    nodelay(stdscr, FALSE);
+    int sel = 0;
+    while (1) {
+        erase();
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        (void)cols;
+        for (int i = 0; i < rows - 1; i++) mvaddch(i, 0, ' ');
+
+        mvaddstr(1, 2, "+----------------- Pick Level Config -----------------+");
+        mvprintw(2, 2, "| Folder: %-44s |", LEVEL_DIR);
+        for (int i = 0; i < n; i++) {
+            char marker = (i == sel) ? '>' : ' ';
+            if (i == sel) attron(A_REVERSE | A_BOLD);
+            mvprintw(4 + i, 2, "| %c %-50s |", marker, entries[i].name);
+            if (i == sel) attroff(A_REVERSE | A_BOLD);
+        }
+        mvprintw(5 + n, 2,
+                 "| [Up/Down] Move   [Enter] Select   [q/Esc] Cancel    |");
+        mvaddstr(6 + n, 2,
+                 "+-----------------------------------------------------+");
+        refresh();
+
+        int ch = getch();
+        if (ch == KEY_UP)        sel = (sel - 1 + n) % n;
+        else if (ch == KEY_DOWN) sel = (sel + 1) % n;
+        else if (ch == 27 || ch == 'q' || ch == 'Q') {
+            nodelay(stdscr, TRUE);
+            log_msg("Level load cancelled.");
+            return;
+        }
+        else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) break;
+    }
+    nodelay(stdscr, TRUE);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", LEVEL_DIR, entries[sel].name);
+
+    level_config_t tmp = {0};
+    char err[96];
+    if (level_config_load(path, &tmp, err, sizeof(err)) != 0) {
+        log_msg("Level load failed (%s): %s", path, err);
+        return;
+    }
+    level_config_free(&level_cfg);
+    level_cfg = tmp;
+    level_cfg_loaded = true;
+    log_msg("Level loaded: %s (%ux%u, s=%u d=%u r=%u t=%u)",
+            entries[sel].name, level_cfg.rows, level_cfg.cols,
+            level_cfg.speed, level_cfg.danger_ticks, level_cfg.radius,
+            level_cfg.bomb_timer_ticks);
+    assign_player_starts();
+    broadcast_map();
 }
 
 int init_ncurses() {
@@ -167,6 +309,7 @@ int init_ncurses() {
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
     curs_set(0);
+    set_escdelay(25);
     clear();
     return 0;
 }
@@ -196,23 +339,30 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             memcpy(player_name, buffer + HEADER_LEN + CLIENT_ID_LEN, PLAYER_NAME_LEN);
 
             snprintf(clients[client_idx].p.name, MAX_NAME_LEN + 1, "%s", player_name);
-            clients[client_idx].p.id = client_idx;
+            clients[client_idx].p.id = (uint8_t)(client_idx + 1);
             clients[client_idx].p.alive = true;
 
-            log_msg("C%d -> HELLO (id=%s, name=%s)", cn, client_id, clients[client_idx].p.name);
+            log_msg("C%d -> HELLO (id=%s, name=%s)",
+                    cn, client_id, clients[client_idx].p.name);
 
-            char welcome_buf[256];
-            snprintf(welcome_buf, sizeof(welcome_buf), "Welcome %s to Bomberman!", clients[client_idx].p.name);
-            write(client_fd, welcome_buf, strlen(welcome_buf));
-            log_msg("C%d <- WELCOME", cn);
+            uint8_t pid = clients[client_idx].p.id;
+            if (send_welcome(client_fd, pid) == 0) {
+                log_msg("C%d <- WELCOME (id=%u)", cn, pid);
+            }
+
+            if (level_cfg_loaded) {
+                assign_player_starts();
+                if (send_map_to(client_fd, pid) == 0) {
+                    log_msg("C%d <- MAP (%ux%u)", cn,
+                            level_cfg.rows, level_cfg.cols);
+                }
+            }
             return 0;
         }
 
         case MSG_PING: {
             log_msg("C%d -> PING", cn);
-            char pong_buf[256];
-            snprintf(pong_buf, sizeof(pong_buf), "PONG");
-            write(client_fd, pong_buf, strlen(pong_buf));
+            send_simple(client_fd, MSG_PONG, clients[client_idx].p.id);
             log_msg("C%d <- PONG", cn);
             return 0;
         }
@@ -225,36 +375,26 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
         case MSG_SET_READY: {
             log_msg("C%d -> SET_READY", cn);
             clients[client_idx].p.ready = true;
+            broadcast_simple(MSG_SET_READY, clients[client_idx].p.id);
+            check_match_start();
             return 0;
         }
 
         case MSG_MOVE_ATTEMPT: {
             log_msg("C%d -> MOVE_ATTEMPT", cn);
-            char ack[64];
-            snprintf(ack, sizeof(ack), "MSG_MOVED");
-            write(client_fd, ack, strlen(ack));
-            log_msg("C%d <- MOVED", cn);
             return 0;
         }
 
         case MSG_BOMB_ATTEMPT: {
             log_msg("C%d -> BOMB_ATTEMPT", cn);
-            char ack[64];
-            snprintf(ack, sizeof(ack), "MSG_BOMB");
-            write(client_fd, ack, strlen(ack));
-            log_msg("C%d <- BOMB", cn);
             return 0;
         }
 
         case MSG_SYNC_REQUEST: {
             log_msg("C%d -> SYNC_REQUEST", cn);
-            if (current_game_state == GAME_RUNNING) {
-                char sync_buf[1024];
-                snprintf(sync_buf, sizeof(sync_buf), "SYNC_BOARD_DATA");
-                write(client_fd, sync_buf, strlen(sync_buf));
-                log_msg("C%d <- SYNC_BOARD", cn);
-            } else {
-                log_msg("C%d <- (sync ignored: not running)", cn);
+            if (current_game_state == GAME_RUNNING && level_cfg_loaded) {
+                send_map_to(client_fd, clients[client_idx].p.id);
+                log_msg("C%d <- MAP (sync)", cn);
             }
             return 0;
         }
@@ -287,19 +427,28 @@ void draw_ui() {
 
     // Fixed mvaddstr usage: y, x, string (no %d inside string)
     mvprintw(y++, x, "Active Players: %d / %d", active_clients_count, MAX_PLAYERS);
-    
+
     for (int i = 0; i < active_clients_count; i++) {
-        if(clients[i].p.alive) {
-            // Use %s for string, not %d. Handle potential null terminators if needed.
-            mvprintw(y++, x, "- [%s] (Alive)", clients[i].p.name);
-        } else {
-            mvprintw(y++, x, "- [%s] (DEAD)", clients[i].p.name);
-        }
+        const char *life = clients[i].p.alive ? "Alive" : "DEAD";
+        const char *ready = clients[i].p.ready ? "READY" : "not ready";
+        mvprintw(y++, x, "- id=%u [%s] (%s, %s) @ (%u,%u)",
+                 clients[i].p.id, clients[i].p.name, life, ready,
+                 clients[i].p.row, clients[i].p.col);
+    }
+
+    y++;
+    if (level_cfg_loaded) {
+        mvprintw(y++, x, "Level: %ux%u  speed=%u  danger=%ut  radius=%u  bomb=%ut",
+                 level_cfg.rows, level_cfg.cols, level_cfg.speed,
+                 level_cfg.danger_ticks, level_cfg.radius,
+                 level_cfg.bomb_timer_ticks);
+    } else {
+        mvaddstr(y++, x, "Level: (none loaded - press [l])");
     }
 
     y++;
     mvaddstr(y++, x, "Controls:");
-    mvaddstr(y++, x, "  [q] Quit Server");
+    mvaddstr(y++, x, "  [l] Load level   [q] Quit Server");
 
     y++;
     mvaddstr(y++, x, "=== Logs ===");
@@ -341,6 +490,8 @@ int main(int argc, char *argv[]) {
 
     init_ncurses();
 
+    log_msg("Press [l] to load a level configuration file.");
+
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
 
@@ -372,6 +523,9 @@ int main(int argc, char *argv[]) {
         int ch = getch();
         if(ch == 'q') {
             cleanup(0);
+        }
+        else if (ch == 'l' || ch == 'L') {
+            load_level_dialog();
         }
         
         fd_set readfds;
@@ -410,19 +564,12 @@ int main(int argc, char *argv[]) {
                 int flags = fcntl(new_sock, F_GETFL, 0);
                 fcntl(new_sock, F_SETFL, flags | O_NONBLOCK);
 
-                // Add to client list
                 if (active_clients_count < MAX_CLIENTS) {
                     reset_client_data(active_clients_count);
                     clients[active_clients_count].fd = new_sock;
-
-                    // Send initial request to identify client
-                    char hello_req[64];
-                    snprintf(hello_req, sizeof(hello_req), "HELLO_REQ");
-                    write(new_sock, hello_req, strlen(hello_req));
-
                     active_clients_count++;
-                    log_msg("Client %d connected.", active_clients_count);
-                    log_msg("C%d <- HELLO_REQ", active_clients_count);
+                    log_msg("Client %d connected (awaiting HELLO).",
+                            active_clients_count);
                 } else {
                     close(new_sock);
                     log_msg("Connection refused: server full.");

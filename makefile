@@ -1,9 +1,13 @@
+CFLAGS = -std=c99 -Wall -Wextra -pedantic -O3 -march=native
+LDLIBS = -lncurses
+COMMON = common/level_config.c common/protocol.c
+
 all:
-	gcc -std=c99 -D_GNU_SOURCE -lncurses -Wall -Wextra -pedantic -O3 -march=native client/main.c -o client_bbm && echo "client made" && gcc -std=c99 -lncurses -Wall -Wextra -pedantic -O3 -march=native server/main.c -o server_bbm && echo "server made"
+	gcc $(CFLAGS) -D_GNU_SOURCE client/main.c $(COMMON) -o client_bbm $(LDLIBS) && echo "client made" && gcc $(CFLAGS) server/main.c $(COMMON) -o server_bbm $(LDLIBS) && echo "server made"
 create_client:
-	gcc -std=c99 -D_GNU_SOURCE -lncurses -Wall -Wextra -pedantic -O3 -march=native client/main.c -o client_bbm
+	gcc $(CFLAGS) -D_GNU_SOURCE client/main.c $(COMMON) -o client_bbm $(LDLIBS)
 create_server:
-	gcc -std=c99 -lncurses -Wall -Wextra -pedantic -O3 -march=native server/main.c -o server_bbm
+	gcc $(CFLAGS) server/main.c $(COMMON) -o server_bbm $(LDLIBS)
 start_client:
 	./client_bbm
 start_server:
