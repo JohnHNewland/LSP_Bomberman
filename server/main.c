@@ -2,19 +2,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>      // Required for usleep, write, close
+#include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
-#include <fcntl.h>       // Required for fcntl, O_NONBLOCK
-#include <sys/select.h>  // Required for fd_set, select, timeval
+#include <fcntl.h>
+#include <sys/select.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <ncurses.h>
 
-#define PORT 7890
+#define DEFAULT_HOST "127.0.0.1"
+#define DEFAULT_PORT 7890
 #define BUFFER_SIZE 256 
 #define MAX_CLIENTS 16 
 
@@ -224,13 +225,13 @@ void draw_ui() {
     
     switch(current_game_state) {
         case GAME_LOBBY: 
-            mvprintw(y++, x, "LOBBY [WAITING FOR PLAYERS]"); 
+            mvprintw(y++, x, "LOBBY [WAITING FOR PLAYERS]\n"); 
             break;
         case GAME_RUNNING: 
-            mvprintw(y++, x, "RUNNING [GAME IN PROGRESS]"); 
+            mvprintw(y++, x, "RUNNING [GAME IN PROGRESS]\n"); 
             break;
         case GAME_END: 
-            mvprintw(y++, x, "ENDED"); 
+            mvprintw(y++, x, "ENDED\n"); 
             break;
     }
 
@@ -253,8 +254,26 @@ void draw_ui() {
 }
 
 int main(int argc, char *argv[]) {
-    // Handle command line args if necessary (e.g., port override)
-    // Currently hardcoded to PORT 7890 and 127.0.0.1 as per request
+    char *host = DEFAULT_HOST;
+    int port = DEFAULT_PORT;
+
+    if (argc == 2) {
+        char *colon = strchr(argv[1], ':');
+        if (colon) {
+            *colon = '\0';        // null-terminate host at the colon
+            host = argv[1];
+            port = atoi(colon + 1);
+        } else {
+            host = argv[1];       // no port specified, use default
+        }
+    }
+    else {
+        printf("Wrong server IP. Use ./server_bbm IP:PORT");
+        exit(1);
+    }
+
+    printf("Starting Bomberman Server...\n");
+    printf("Binding to: %s:%d\n", host, port);
     
     signal(SIGINT, cleanup);
     signal(SIGTERM, cleanup);
@@ -269,9 +288,9 @@ int main(int argc, char *argv[]) {
 
     struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(port);
     
-    if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, host, &server_addr.sin_addr) <= 0) {
         perror("Invalid address"); return 1;
     }
 
@@ -283,11 +302,16 @@ int main(int argc, char *argv[]) {
         perror("listen"); return 1;
     }
 
-    printf("Bomberman Server listening on 127.0.0.1:%d\n", PORT);
+    printf("Bomberman Server listening on %s:%d\n", host, port);
     printf("Config: MaxPlayers=%d, TickRate=%dHz\n", MAX_PLAYERS, TICKS_PER_SECOND);
 
     while (running) {
         draw_ui();
+
+        int ch = getch();
+        if(ch == 'q') {
+            cleanup(0);
+        }
         
         fd_set readfds;
         FD_ZERO(&readfds);
