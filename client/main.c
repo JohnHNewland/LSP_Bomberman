@@ -28,8 +28,8 @@
 #define DEFAULT_PORT 7890
 #define BUFFER_SIZE 8192
 
-#define CLIENT_ID_STR "bbm-client-0.1"
-#define DEFAULT_PLAYER_NAME "player"
+#define CLIENT_ID_STR "bbm-client-1.0"
+#define DEFAULT_PLAYER_NAME "Player"
 
 #define PAIR_TITLE    1
 #define PAIR_BORDER   2
@@ -58,7 +58,6 @@
 #define PAIR_EXPL    25
 
 static int sock_fd = -1;
-static volatile sig_atomic_t running = 1;
 
 static level_config_t level_cfg = {0};
 static bool level_cfg_loaded = false;
@@ -84,10 +83,11 @@ typedef struct {
 
 static client_player_t players[MAX_PLAYERS + 1] = {0};
 
+// Notifications
 #define NOTIF_MAX      6
 #define NOTIF_LINE_LEN 80
 static char notif_buf[NOTIF_MAX][NOTIF_LINE_LEN];
-static int  notif_count = 0;
+static int notif_count = 0;
 
 #define MAP_PICKER_MAX 64
 typedef struct {
@@ -117,8 +117,10 @@ static void notif_clear(void) {
 }
 
 static const char *player_label(uint8_t id) {
-    if (id >= 1 && id <= MAX_PLAYERS && players[id].name[0])
+    if (id >= 1 && id <= MAX_PLAYERS && players[id].name[0]) {
         return players[id].name;
+    }
+
     static char fallback[16];
     snprintf(fallback, sizeof(fallback), "P%u", id);
     return fallback;
@@ -164,7 +166,10 @@ static void cleanup(int sig) {
 }
 
 static void init_colors(void) {
-    if (!has_colors()) return;
+    if (!has_colors()) {
+        return;
+    }
+
     start_color();
     use_default_colors();
     init_pair(PAIR_TITLE,    COLOR_YELLOW, -1);
@@ -226,16 +231,22 @@ static int connect_to_server(const char *host, int port) {
     int last_err = ECONNREFUSED;
     for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
         fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) { last_err = errno; continue; }
+        if (fd < 0) {
+            last_err = errno;
+            continue;
+        }
 
         int flags = fcntl(fd, F_GETFL, 0);
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
         int rc = connect(fd, p->ai_addr, p->ai_addrlen);
-        if (rc == 0) break;
+        if (rc == 0) {
+            break;
+        }
         if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
             last_err = errno;
-            close(fd); fd = -1;
+            close(fd);
+            fd = -1;
             continue;
         }
 
@@ -246,22 +257,27 @@ static int connect_to_server(const char *host, int port) {
         int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
         if (sel <= 0) {
             last_err = (sel == 0) ? ETIMEDOUT : errno;
-            close(fd); fd = -1;
+            close(fd);
+            fd = -1;
             continue;
         }
 
         int sockerr = 0;
         socklen_t slen = sizeof(sockerr);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &slen) < 0
-            || sockerr != 0) {
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &slen) < 0 || sockerr != 0) {
             last_err = sockerr ? sockerr : errno;
-            close(fd); fd = -1;
+            close(fd);
+            fd = -1;
             continue;
         }
         break;
     }
     freeaddrinfo(res);
-    if (fd < 0) { errno = last_err; return -1; }
+    if (fd < 0) {
+        errno = last_err;
+        return -1;
+    }
+
     return fd;
 }
 
@@ -271,10 +287,14 @@ static int send_hello(int fd, const char *player_name) {
     m.hdr.sender_id = ID_UNKNOWN;
     m.hdr.target_id = ID_SERVER;
     size_t cid = strlen(CLIENT_ID_STR);
-    if (cid > sizeof(m.client_id)) cid = sizeof(m.client_id);
+    if (cid > sizeof(m.client_id)) {
+        cid = sizeof(m.client_id);
+    }
     memcpy(m.client_id, CLIENT_ID_STR, cid);
     size_t pn = strlen(player_name);
-    if (pn > sizeof(m.player_name)) pn = sizeof(m.player_name);
+    if (pn > sizeof(m.player_name)) {
+        pn = sizeof(m.player_name);
+    }
     memcpy(m.player_name, player_name, pn);
     return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
 }
@@ -344,8 +364,9 @@ static int send_map_select(int fd, const char *name) {
 static uint8_t leader_id(void) {
     uint8_t lead = 0;
     for (int i = 1; i <= MAX_PLAYERS; i++) {
-        if (players[i].active && (lead == 0 || (uint8_t)i < lead))
+        if (players[i].active && (lead == 0 || (uint8_t)i < lead)) {
             lead = (uint8_t)i;
+        }
     }
     return lead;
 }
@@ -360,8 +381,13 @@ static ssize_t poll_recv(int fd, char *buf, size_t cap) {
     FD_SET(fd, &rfds);
     struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
     int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
-    if (ret < 0) return -1;
-    if (ret == 0) { errno = EAGAIN; return -1; }
+    if (ret < 0) {
+        return -1;
+    }
+    if (ret == 0) {
+        errno = EAGAIN;
+        return -1;
+    }
     return read(fd, buf, cap);
 }
 
@@ -382,11 +408,12 @@ static void draw_box(int y, int x, int h, int w) {
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-static void draw_centered(int y, int width_avail, const char *s,
-                          int color_pair, int attr) {
+static void draw_centered(int y, int width_avail, const char *s, int color_pair, int attr) {
     int len = (int)strlen(s);
     int x = (width_avail - len) / 2;
-    if (x < 0) x = 0;
+    if (x < 0) {
+        x = 0;
+    }
     attron(COLOR_PAIR(color_pair) | attr);
     mvaddstr(y, x, s);
     attroff(COLOR_PAIR(color_pair) | attr);
@@ -395,12 +422,13 @@ static void draw_centered(int y, int width_avail, const char *s,
 static void draw_banner(int y, int width_avail) {
     int bw = (int)strlen(BANNER[0]);
     if (width_avail < bw + 4) {
-        draw_centered(y + BANNER_H / 2, width_avail,
-                      "B O M B E R M A N", PAIR_TITLE, A_BOLD);
+        draw_centered(y + BANNER_H / 2, width_avail, "B O M B E R M A N", PAIR_TITLE, A_BOLD);
         return;
     }
     int x = (width_avail - bw) / 2;
-    if (x < 0) x = 0;
+    if (x < 0) {
+        x = 0;
+    }
     attron(COLOR_PAIR(PAIR_TITLE) | A_BOLD);
     for (int i = 0; i < BANNER_H; i++) {
         mvaddstr(y + i, x, BANNER[i]);
@@ -421,7 +449,9 @@ static void draw_status_bar(const char *help, const char *msg, int msg_pair) {
     }
     if (msg && msg[0]) {
         int x = cols - (int)strlen(msg) - 1;
-        if (x < 0) x = 0;
+        if (x < 0) {
+            x = 0;
+        }
         attron(COLOR_PAIR(msg_pair) | A_BOLD);
         mvaddstr(y, x, msg);
         attroff(COLOR_PAIR(msg_pair) | A_BOLD);
@@ -437,9 +467,7 @@ static const char *MENU_ITEMS[MENU_ITEM_COUNT] = {
 };
 static const char MENU_HOTKEYS[MENU_ITEM_COUNT] = { 'j', 'h', 'n', 'q' };
 
-static void draw_menu(const char *host, int port,
-                      const char *player_name, int sel,
-                      const char *status, int status_pair) {
+static void draw_menu(const char *host, int port, const char *player_name, int sel, const char *status, int status_pair) {
     erase();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -450,11 +478,13 @@ static void draw_menu(const char *host, int port,
     draw_banner(banner_y, cols);
 
     int sub_y = banner_y + BANNER_H + 1;
-    draw_centered(sub_y, cols, "[ Network Client v0.1 ]", PAIR_INFO, 0);
+    draw_centered(sub_y, cols, "[ Client v1.0.0 ]", PAIR_INFO, 0);
 
     int info_y = sub_y + 2;
     int info_x = cols / 2 - 18;
-    if (info_x < 4) info_x = 4;
+    if (info_x < 4) {
+        info_x = 4;
+    }
 
     attron(COLOR_PAIR(PAIR_NORMAL));
     mvaddstr(info_y,     info_x, "Server : ");
@@ -468,7 +498,9 @@ static void draw_menu(const char *host, int port,
 
     int menu_y = info_y + 3;
     int menu_x = cols / 2 - 16;
-    if (menu_x < 4) menu_x = 4;
+    if (menu_x < 4) {
+        menu_x = 4;
+    }
 
     for (int i = 0; i < MENU_ITEM_COUNT; i++) {
         int y = menu_y + i;
@@ -490,11 +522,7 @@ static void draw_menu(const char *host, int port,
     int cfg_x = menu_x;
     if (level_cfg_loaded) {
         attron(COLOR_PAIR(PAIR_INFO));
-        mvprintw(cfg_y, cfg_x,
-                 "Level: %ux%u  speed=%u  radius=%u  bomb=%ut  danger=%ut",
-                 level_cfg.rows, level_cfg.cols, level_cfg.speed,
-                 level_cfg.radius, level_cfg.bomb_timer_ticks,
-                 level_cfg.danger_ticks);
+        mvprintw(cfg_y, cfg_x, "Level: %ux%u  speed=%u  radius=%u  bomb=%ut  danger=%ut", level_cfg.rows, level_cfg.cols, level_cfg.speed, level_cfg.radius, level_cfg.bomb_timer_ticks, level_cfg.danger_ticks);
         attroff(COLOR_PAIR(PAIR_INFO));
     } else {
         attron(COLOR_PAIR(PAIR_NORMAL));
@@ -502,13 +530,37 @@ static void draw_menu(const char *host, int port,
         attroff(COLOR_PAIR(PAIR_NORMAL));
     }
 
-    draw_status_bar(" [Up/Down] Navigate  [Enter] Select  [j] Join  [h] Host  [n] Name  [l] Load  [q] Quit",
-                    status, status_pair);
+    draw_status_bar(" [Up/Down] Navigate  [Enter] Select  [j] Join  [h] Host  [n] Name  [l] Load  [q] Quit", status, status_pair);
     refresh();
 }
 
-#define CELL_W 3
-#define CELL_H 2
+#define MIN_CELL_W 3
+#define MIN_CELL_H 2
+#define MAX_CELL_W 12
+#define MAX_CELL_H 6
+
+static void compute_cell_size(int avail_w, int avail_h, int rows, int cols,
+                              int *cell_w, int *cell_h) {
+    int cw = (cols > 0) ? avail_w / cols : MIN_CELL_W;
+    int ch = (rows > 0) ? avail_h / rows : MIN_CELL_H;
+    if (cw < MIN_CELL_W) {
+        cw = MIN_CELL_W;
+    }
+    if (ch < MIN_CELL_H) {
+        ch = MIN_CELL_H;
+    }
+    if (cw > MAX_CELL_W) {
+        cw = MAX_CELL_W;
+    }
+    if (ch > MAX_CELL_H) {
+        ch = MAX_CELL_H;
+    }
+    if (cw > 2 * ch) {
+        cw = 2 * ch;
+    }
+    *cell_w = cw;
+    *cell_h = ch;
+}
 
 static int player_pair(uint8_t pid) {
     switch (pid) {
@@ -524,14 +576,17 @@ static int player_pair(uint8_t pid) {
     }
 }
 
-static void cell_glyphs(const cell_t *cell, int r, int c,
-                        int *pair, int *attr,
-                        char top[CELL_W + 1], char bot[CELL_W + 1]) {
+static void cell_glyphs(const cell_t *cell, int r, int c, int *pair, int *attr, int cell_h, int cell_w, char rows[][MAX_CELL_W + 1]) {
     (void)r; (void)c;
     *pair = PAIR_FLOOR;
     *attr = 0;
-    memcpy(top, "   ", 4);
-    memcpy(bot, "   ", 4);
+    for (int i = 0; i < cell_h; i++) {
+        memset(rows[i], ' ', cell_w);
+        rows[i][cell_w] = '\0';
+    }
+    int gy = cell_h / 2;
+    int gx = cell_w / 2;
+    char glyph = 0;
     switch (cell->type) {
         case CELL_EMPTY:
             *attr = A_DIM;
@@ -545,7 +600,7 @@ static void cell_glyphs(const cell_t *cell, int r, int c,
         case CELL_BOMB:
             *pair = PAIR_BOMB;
             *attr = A_BOLD;
-            top[1] = 'o';
+            glyph = 'o';
             break;
         case CELL_EXPLOSION:
             *pair = PAIR_EXPL;
@@ -553,43 +608,49 @@ static void cell_glyphs(const cell_t *cell, int r, int c,
         case CELL_PLAYER_START:
             *pair = player_pair(cell->player_id);
             *attr = A_BOLD;
-            top[1] = (char)('0' + cell->player_id);
+            glyph = (char)('0' + cell->player_id);
             break;
         case CELL_BONUS_SPEED:
             *pair = PAIR_B_SPEED;
             *attr = A_BOLD;
-            top[1] = 'A';
+            glyph = 'A';
             break;
         case CELL_BONUS_RADIUS:
             *pair = PAIR_B_RAD;
             *attr = A_BOLD;
-            top[1] = 'R';
+            glyph = 'R';
             break;
         case CELL_BONUS_TIMER:
             *pair = PAIR_B_TIMER;
             *attr = A_BOLD;
-            top[1] = 'T';
+            glyph = 'T';
             break;
         case CELL_BONUS_BOMBS:
             *pair = PAIR_B_BOMBS;
             *attr = A_BOLD;
-            top[1] = 'N';
+            glyph = 'N';
             break;
+    }
+    if (glyph) {
+        rows[gy][gx] = glyph;
     }
 }
 
-static void draw_cell(int y, int x, const cell_t *cell, int r, int c) {
+static void draw_cell(int y, int x, const cell_t *cell, int r, int c, int cell_h, int cell_w) {
     int pair = PAIR_FLOOR, attr = 0;
-    char top[CELL_W + 1] = "   ", bot[CELL_W + 1] = "   ";
-    cell_glyphs(cell, r, c, &pair, &attr, top, bot);
+    char rows[MAX_CELL_H][MAX_CELL_W + 1];
+    cell_glyphs(cell, r, c, &pair, &attr, cell_h, cell_w, rows);
     attron(COLOR_PAIR(pair) | attr);
-    mvaddstr(y,     x, top);
-    mvaddstr(y + 1, x, bot);
+    for (int i = 0; i < cell_h; i++) {
+        mvaddstr(y + i, x, rows[i]);
+    }
     attroff(COLOR_PAIR(pair) | attr);
 }
 
 static int draw_player_table(int x, int y, int max_y) {
-    if (y + 3 >= max_y) return y;
+    if (y + 3 >= max_y) {
+        return y;
+    }
 
     attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
     mvaddstr(y++, x, "Players");
@@ -599,16 +660,16 @@ static int draw_player_table(int x, int y, int max_y) {
 
     attron(COLOR_PAIR(PAIR_NORMAL) | A_DIM);
     if (in_match) {
-        mvprintw(y++, x, "    %-3s %-14s %-4s %2s %2s %2s %3s",
-                 "ID", "Name", "St", "Bm", "Rd", "Sp", "Fu");
+        mvprintw(y++, x, "    %-3s %-14s %-4s %2s %2s %2s %3s", "ID", "Name", "St", "Bm", "Rd", "Sp", "Fu");
     } else {
-        mvprintw(y++, x, "    %-3s %-14s %s",
-                 "ID", "Name", "Ready");
+        mvprintw(y++, x, "    %-3s %-14s %s", "ID", "Name", "Ready");
     }
     attroff(COLOR_PAIR(PAIR_NORMAL) | A_DIM);
 
     for (int i = 1; i <= MAX_PLAYERS && y < max_y - 1; i++) {
-        if (!players[i].active) continue;
+        if (!players[i].active) {
+            continue;
+        }
         const client_player_t *p = &players[i];
         const char *name = p->name[0] ? p->name : "?";
         bool is_me = ((uint8_t)i == my_player_id);
@@ -626,21 +687,13 @@ static int draw_player_table(int x, int y, int max_y) {
         if (in_match) {
             const char *st = p->alive ? "OK" : "DEAD";
             if (p->alive) {
-                mvprintw(y, x + 4,
-                         "P%-2u %-14.14s %-4s %2u %2u %2u %3u",
-                         (unsigned)i, name, st,
-                         p->bomb_count, p->bomb_radius,
-                         p->speed, p->bomb_timer_ticks);
+                mvprintw(y, x + 4, "P%-2u %-14.14s %-4s %2u %2u %2u %3u", (unsigned)i, name, st, p->bomb_count, p->bomb_radius, p->speed, p->bomb_timer_ticks);
             } else {
-                mvprintw(y, x + 4,
-                         "P%-2u %-14.14s %-4s %2s %2s %2s %3s",
-                         (unsigned)i, name, st, "-", "-", "-", "-");
+                mvprintw(y, x + 4, "P%-2u %-14.14s %-4s %2s %2s %2s %3s", (unsigned)i, name, st, "-", "-", "-", "-");
             }
         } else {
             const char *st = p->ready ? "READY" : "...";
-            mvprintw(y, x + 4,
-                     "P%-2u %-14.14s %s",
-                     (unsigned)i, name, st);
+            mvprintw(y, x + 4, "P%-2u %-14.14s %s", (unsigned)i, name, st);
         }
         attroff(COLOR_PAIR(pair) | A_BOLD);
         y++;
@@ -654,11 +707,17 @@ static void draw_map_picker(void) {
     int n = map_picker_count;
     int box_w = 60;
     int box_h = n + 6;
-    if (box_h > rows - 2) box_h = rows - 2;
+    if (box_h > rows - 2) {
+        box_h = rows - 2;
+    }
     int by = (rows - box_h) / 2;
     int bx = (cols - box_w) / 2;
-    if (by < 1) by = 1;
-    if (bx < 1) bx = 1;
+    if (by < 1) {
+        by = 1;
+    }
+    if (bx < 1) {
+        bx = 1;
+    }
 
     attron(COLOR_PAIR(PAIR_TITLE) | A_BOLD);
     for (int i = 0; i < box_w; i++) {
@@ -674,27 +733,29 @@ static void draw_map_picker(void) {
 
     int max_show = box_h - 5;
     int first = 0;
-    if (map_picker_sel >= max_show) first = map_picker_sel - max_show + 1;
+    if (map_picker_sel >= max_show) {
+        first = map_picker_sel - max_show + 1;
+    }
     int last = first + max_show;
-    if (last > n) last = n;
+    if (last > n) {
+        last = n;
+    }
     attron(COLOR_PAIR(PAIR_NORMAL));
     for (int i = first; i < last; i++) {
         int row = by + 3 + (i - first);
         const map_picker_entry_t *e = &map_picker_entries[i];
-        if (i == map_picker_sel)
+        if (i == map_picker_sel) {
             attron(A_REVERSE | A_BOLD);
-        mvprintw(row, bx + 2,
-                 " %c %-28s  %3ux%-3u  up to %u ",
-                 (i == map_picker_sel) ? '>' : ' ',
-                 e->name, e->rows, e->cols, e->max_players);
-        if (i == map_picker_sel)
+        }
+        mvprintw(row, bx + 2, " %c %-28s  %3ux%-3u  up to %u ", (i == map_picker_sel) ? '>' : ' ', e->name, e->rows, e->cols, e->max_players);
+        if (i == map_picker_sel) {
             attroff(A_REVERSE | A_BOLD);
+        }
     }
     attroff(COLOR_PAIR(PAIR_NORMAL));
 
     attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
-    mvaddstr(by + box_h - 2, bx + 2,
-             "[Up/Down] Move  [Enter] Pick  [Esc/q] Cancel");
+    mvaddstr(by + box_h - 2, bx + 2, "[Up/Down] Move  [Enter] Pick  [Esc/q] Cancel");
     attroff(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
 }
 
@@ -728,7 +789,9 @@ static void draw_legend(int y, int x) {
 }
 
 static void preview_level(void) {
-    if (!level_cfg_loaded) return;
+    if (!level_cfg_loaded) {
+        return;
+    }
     nodelay(stdscr, FALSE);
 
     while (1) {
@@ -749,8 +812,7 @@ static void preview_level(void) {
         mvaddstr(info_y + 4, info_x, "Danger:  ");
         attroff(COLOR_PAIR(PAIR_NORMAL));
         attron(COLOR_PAIR(PAIR_INFO) | A_BOLD);
-        mvprintw(info_y,     info_x + 9, "%ux%u",
-                 level_cfg.rows, level_cfg.cols);
+        mvprintw(info_y, info_x + 9, "%ux%u", level_cfg.rows, level_cfg.cols);
         mvprintw(info_y + 1, info_x + 9, "%u blocks/s", level_cfg.speed);
         mvprintw(info_y + 2, info_x + 9, "%u ticks", level_cfg.bomb_timer_ticks);
         mvprintw(info_y + 3, info_x + 9, "%u blocks", level_cfg.radius);
@@ -765,15 +827,25 @@ static void preview_level(void) {
         int map_y = info_y;
         int avail_w = cols - map_x - 4;
         int avail_h = rows - map_y - 4;
+        int cell_w, cell_h;
+        compute_cell_size(avail_w, avail_h, level_cfg.rows, level_cfg.cols, &cell_w, &cell_h);
         int draw_cols = level_cfg.cols;
         int draw_rows = level_cfg.rows;
-        if (draw_cols * CELL_W > avail_w) draw_cols = avail_w / CELL_W;
-        if (draw_rows * CELL_H > avail_h) draw_rows = avail_h / CELL_H;
-        if (draw_cols < 0) draw_cols = 0;
-        if (draw_rows < 0) draw_rows = 0;
+        if (draw_cols * cell_w > avail_w) {
+            draw_cols = avail_w / cell_w;
+        }
+        if (draw_rows * cell_h > avail_h) {
+            draw_rows = avail_h / cell_h;
+        }
+        if (draw_cols < 0) {
+            draw_cols = 0;
+        }
+        if (draw_rows < 0) {
+            draw_rows = 0;
+        }
 
-        int frame_w = draw_cols * CELL_W;
-        int frame_h = draw_rows * CELL_H;
+        int frame_w = draw_cols * cell_w;
+        int frame_h = draw_rows * cell_h;
 
         attron(COLOR_PAIR(PAIR_BORDER) | A_BOLD);
         for (int i = -1; i <= frame_w; i++) {
@@ -794,23 +866,19 @@ static void preview_level(void) {
             for (int c = 0; c < draw_cols; c++) {
                 cell_t cell = *level_cell_at(&level_cfg, r, c);
                 for (int pi = 1; pi <= MAX_PLAYERS; pi++) {
-                    if (players[pi].active && players[pi].alive &&
-                        players[pi].row == r && players[pi].col == c) {
+                    if (players[pi].active && players[pi].alive && players[pi].row == r && players[pi].col == c) {
                         cell.type = CELL_PLAYER_START;
                         cell.player_id = (uint8_t)pi;
                         break;
                     }
                 }
-                draw_cell(map_y + r * CELL_H,
-                          map_x + c * CELL_W, &cell, r, c);
+                draw_cell(map_y + r * cell_h, map_x + c * cell_w, &cell, r, c, cell_h, cell_w);
             }
         }
 
         if (draw_cols < level_cfg.cols || draw_rows < level_cfg.rows) {
             attron(COLOR_PAIR(PAIR_STATUS) | A_BOLD);
-            mvprintw(map_y + frame_h + 1, map_x,
-                     "(clipped: %dx%d of %ux%u, resize terminal)",
-                     draw_rows, draw_cols, level_cfg.rows, level_cfg.cols);
+            mvprintw(map_y + frame_h + 1, map_x, "(clipped: %dx%d of %ux%u, resize terminal)", draw_rows, draw_cols, level_cfg.rows, level_cfg.cols);
             attroff(COLOR_PAIR(PAIR_STATUS) | A_BOLD);
         }
 
@@ -818,8 +886,9 @@ static void preview_level(void) {
         refresh();
 
         int ch = getch();
-        if (ch == 'q' || ch == 'Q' || ch == 27 ||
-            ch == '\n' || ch == '\r' || ch == KEY_ENTER) break;
+        if (ch == 'q' || ch == 'Q' || ch == 27 || ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            break;
+        }
     }
 
     nodelay(stdscr, TRUE);
@@ -838,7 +907,9 @@ static void edit_server(char *host_buf, size_t host_cap, int *port) {
     draw_centered(2, cols, "=== Edit Server Address ===", PAIR_TITLE, A_BOLD);
 
     int x = cols / 2 - 22;
-    if (x < 4) x = 4;
+    if (x < 4) {
+        x = 4;
+    }
     attron(COLOR_PAIR(PAIR_NORMAL));
     mvprintw(5, x, "Current : %s:%d", host_buf, *port);
     mvprintw(7, x, "Format  : HOST[:PORT]  (HOST may be IP or hostname)");
@@ -847,8 +918,7 @@ static void edit_server(char *host_buf, size_t host_cap, int *port) {
     mvaddstr(11, x, "New : ");
     attroff(COLOR_PAIR(PAIR_NORMAL));
 
-    draw_status_bar(" Type address and press Enter (Esc to cancel)",
-                    "", PAIR_INFO);
+    draw_status_bar(" Type address and press Enter (Esc to cancel)", "", PAIR_INFO);
     refresh();
 
     char tmp[256] = {0};
@@ -858,7 +928,9 @@ static void edit_server(char *host_buf, size_t host_cap, int *port) {
         if (colon) {
             *colon = '\0';
             int p = atoi(colon + 1);
-            if (p > 0 && p < 65536) *port = p;
+            if (p > 0 && p < 65536) {
+                *port = p;
+            }
         }
         if (tmp[0] != '\0') {
             snprintf(host_buf, host_cap, "%s", tmp);
@@ -883,7 +955,9 @@ static void edit_name(char *buf, size_t cap) {
     draw_centered(2, cols, "=== Edit Player Name ===", PAIR_TITLE, A_BOLD);
 
     int x = cols / 2 - 18;
-    if (x < 4) x = 4;
+    if (x < 4) {
+        x = 4;
+    }
     attron(COLOR_PAIR(PAIR_NORMAL));
     mvprintw(5, x, "Current : %s", buf);
     mvprintw(7, x, "Max %d chars. Enter to confirm.", (int)cap - 1);
@@ -905,8 +979,7 @@ static void edit_name(char *buf, size_t cap) {
     curs_set(0);
 }
 
-static void draw_ui(const char *host, int port, const char *player_name,
-                    const char *status) {
+static void draw_ui(const char *host, int port, const char *player_name, const char *status) {
     erase();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -927,16 +1000,13 @@ static void draw_ui(const char *host, int port, const char *player_name,
     y += 2;
 
     attron(COLOR_PAIR(PAIR_NORMAL));
-    mvprintw(y++, x, "State: %s",
-             game_state == GAME_RUNNING ? "RUNNING" :
-             game_state == GAME_END     ? "ENDED"   : "LOBBY");
+    mvprintw(y++, x, "State: %s", game_state == GAME_RUNNING ? "RUNNING" : game_state == GAME_END ? "ENDED" : "LOBBY");
     attroff(COLOR_PAIR(PAIR_NORMAL));
 
     y++;
     y = draw_player_table(x, y, rows - 1);
 
-    if ((game_state == GAME_RUNNING || game_state == GAME_END) &&
-        notif_count > 0 && y + 1 < rows - 1) {
+    if ((game_state == GAME_RUNNING || game_state == GAME_END) && notif_count > 0 && y + 1 < rows - 1) {
         y++;
         attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
         mvaddstr(y++, x, "Events");
@@ -954,17 +1024,35 @@ static void draw_ui(const char *host, int port, const char *player_name,
     if (game_state == GAME_RUNNING && level_cfg_loaded) {
         int map_x = 44;
         int map_y = 3;
-        int avail_w = cols - map_x - 4;
+        const int LEGEND_W = 24;
+        const int LEGEND_H = 21;
+        const int LEGEND_GAP = 3;
         int avail_h = rows - map_y - 3;
+        int avail_w_no_legend = cols - map_x - 4;
+        int avail_w_with_legend = avail_w_no_legend - (LEGEND_W + LEGEND_GAP);
+        int min_map_w = level_cfg.cols * MIN_CELL_W;
+        bool legend_fits_v = (map_y + LEGEND_H <= rows - 1);
+        bool show_legend = legend_fits_v && (avail_w_with_legend >= min_map_w);
+        int avail_w = show_legend ? avail_w_with_legend : avail_w_no_legend;
+        int cell_w, cell_h;
+        compute_cell_size(avail_w, avail_h, level_cfg.rows, level_cfg.cols, &cell_w, &cell_h);
         int dc = level_cfg.cols;
         int dr = level_cfg.rows;
-        if (dc * CELL_W > avail_w) dc = avail_w / CELL_W;
-        if (dr * CELL_H > avail_h) dr = avail_h / CELL_H;
-        if (dc < 0) dc = 0;
-        if (dr < 0) dr = 0;
+        if (dc * cell_w > avail_w) {
+            dc = avail_w / cell_w;
+        }
+        if (dr * cell_h > avail_h) {
+            dr = avail_h / cell_h;
+        }
+        if (dc < 0) {
+            dc = 0;
+        }
+        if (dr < 0) {
+            dr = 0;
+        }
 
-        int frame_w = dc * CELL_W;
-        int frame_h = dr * CELL_H;
+        int frame_w = dc * cell_w;
+        int frame_h = dr * cell_h;
 
         attron(COLOR_PAIR(PAIR_BORDER) | A_BOLD);
         for (int i = -1; i <= frame_w; i++) {
@@ -985,16 +1073,11 @@ static void draw_ui(const char *host, int port, const char *player_name,
             for (int c = 0; c < dc; c++) {
                 cell_t cell = *level_cell_at(&level_cfg, r, c);
                 uint8_t shown = 0;
-                if (my_player_id >= 1 && my_player_id <= MAX_PLAYERS &&
-                    players[my_player_id].active &&
-                    players[my_player_id].alive &&
-                    players[my_player_id].row == r &&
-                    players[my_player_id].col == c) {
+                if (my_player_id >= 1 && my_player_id <= MAX_PLAYERS && players[my_player_id].active && players[my_player_id].alive && players[my_player_id].row == r && players[my_player_id].col == c) {
                     shown = my_player_id;
                 } else {
                     for (int pi = 1; pi <= MAX_PLAYERS; pi++) {
-                        if (players[pi].active && players[pi].alive &&
-                            players[pi].row == r && players[pi].col == c) {
+                        if (players[pi].active && players[pi].alive && players[pi].row == r && players[pi].col == c) {
                             shown = (uint8_t)pi;
                             break;
                         }
@@ -1004,18 +1087,16 @@ static void draw_ui(const char *host, int port, const char *player_name,
                     cell.type = CELL_PLAYER_START;
                     cell.player_id = shown;
                 }
-                draw_cell(map_y + r * CELL_H,
-                          map_x + c * CELL_W, &cell, r, c);
+                draw_cell(map_y + r * cell_h, map_x + c * cell_w, &cell, r, c, cell_h, cell_w);
             }
         }
 
-        const int LEGEND_W = 24;
-        const int LEGEND_H = 21;
-        int legend_x = map_x + frame_w + 3;
-        int legend_y = map_y;
-        if (legend_x + LEGEND_W <= cols - 2 &&
-            legend_y + LEGEND_H <= rows - 1) {
-            draw_legend(legend_y, legend_x);
+        if (show_legend) {
+            int legend_x = map_x + frame_w + LEGEND_GAP;
+            int legend_y = map_y;
+            if (legend_x + LEGEND_W <= cols - 2 && legend_y + LEGEND_H <= rows - 1) {
+                draw_legend(legend_y, legend_x);
+            }
         }
     }
 
@@ -1025,7 +1106,9 @@ static void draw_ui(const char *host, int port, const char *player_name,
         int by = rows2 / 2 - 3;
         int bw = 48;
         int bx = (cols2 - bw) / 2;
-        if (bx < 1) bx = 1;
+        if (bx < 1) {
+            bx = 1;
+        }
         attron(COLOR_PAIR(PAIR_TITLE) | A_BOLD);
         for (int i = 0; i < bw; i++) {
             mvaddch(by,     bx + i, '=');
@@ -1037,22 +1120,18 @@ static void draw_ui(const char *host, int port, const char *player_name,
         }
         char line1[] = "G A M E   O V E R";
         char line2[96];
-        const char *winner_name =
-            (last_winner_id >= 1 && last_winner_id <= MAX_PLAYERS &&
-             players[last_winner_id].name[0])
-                ? players[last_winner_id].name : NULL;
+        const char *winner_name = NULL;
+        if (last_winner_id >= 1 && last_winner_id <= MAX_PLAYERS && players[last_winner_id].name[0]) {
+            winner_name = players[last_winner_id].name;
+        }
         if (last_winner_id == ID_UNKNOWN) {
             snprintf(line2, sizeof(line2), "Draw - no survivors");
         } else if (last_winner_id == my_player_id) {
-            snprintf(line2, sizeof(line2),
-                     "You won! (%s)",
-                     winner_name ? winner_name : "");
+            snprintf(line2, sizeof(line2), "You won! (%s)", winner_name ? winner_name : "");
         } else if (winner_name) {
-            snprintf(line2, sizeof(line2),
-                     "%s wins", winner_name);
+            snprintf(line2, sizeof(line2), "%s wins", winner_name);
         } else {
-            snprintf(line2, sizeof(line2),
-                     "Player %u wins", last_winner_id);
+            snprintf(line2, sizeof(line2), "Player %u wins", last_winner_id);
         }
         char line3[] = "[SPACE] new match   [q] quit";
         mvaddstr(by + 2, bx + (bw - (int)strlen(line1)) / 2, line1);
@@ -1062,17 +1141,13 @@ static void draw_ui(const char *host, int port, const char *player_name,
     }
 
     if (game_state == GAME_RUNNING) {
-        draw_status_bar(" [WASD/Arrows] Move   [SPACE] Bomb   [m] Map   [q] Quit",
-                        status, PAIR_STATUS);
+        draw_status_bar(" [WASD/Arrows] Move   [SPACE] Bomb   [m] Map   [q] Quit", status, PAIR_STATUS);
     } else if (game_state == GAME_END) {
-        draw_status_bar(" [SPACE] New match (back to lobby)   [q] Quit",
-                        status, PAIR_STATUS);
+        draw_status_bar(" [SPACE] New match (back to lobby)   [q] Quit", status, PAIR_STATUS);
     } else if (i_am_leader()) {
-        draw_status_bar(" [L] Choose map   [m] Map   [SPACE] Start   [q] Quit",
-                        status, PAIR_STATUS);
+        draw_status_bar(" [L] Choose map   [m] Map   [SPACE] Start   [q] Quit", status, PAIR_STATUS);
     } else {
-        draw_status_bar(" [m] Map   [SPACE] Start   [q] Quit",
-                        status, PAIR_STATUS);
+        draw_status_bar(" [m] Map   [SPACE] Start   [q] Quit", status, PAIR_STATUS);
     }
 
     if (map_picker_open) {
@@ -1097,7 +1172,9 @@ int main(int argc, char *argv[]) {
             snprintf(host, sizeof(host), "%s", argv[1]);
         }
     }
-    if (argc >= 3) initial_name = argv[2];
+    if (argc >= 3) {
+        initial_name = argv[2];
+    }
     if (argc > 3) {
         printf("Usage: %s [HOST[:PORT]] [PLAYER_NAME]\n", argv[0]);
         return 1;
@@ -1117,797 +1194,756 @@ int main(int argc, char *argv[]) {
     int menu_status_pair = PAIR_STATUS;
     int sel = 0;
 
-    while (running) {
-    bool joined = false;
+    // The game loop
+    while (true) {
+        bool joined = false;
 
-    while (!joined && running) {
-        draw_menu(host, port, player_name, sel, menu_status, menu_status_pair);
-
-        int ch = getch();
-        if (ch == ERR) { usleep(20000); continue; }
-
-        int activate_idx = -1;
-        switch (ch) {
-            case KEY_UP:
-                sel = (sel + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
-                break;
-            case KEY_DOWN:
-                sel = (sel + 1) % MENU_ITEM_COUNT;
-                break;
-            case '\n':
-            case '\r':
-            case KEY_ENTER:
-                activate_idx = sel;
-                break;
-            case 'j': case 'J':
-                activate_idx = 0;
-                break;
-            case 'h': case 'H':
-                activate_idx = 1;
-                break;
-            case 'n': case 'N':
-                activate_idx = 2;
-                break;
-            case 'q': case 'Q':
-                activate_idx = 3;
-                break;
-            default:
-                break;
-        }
-
-        if (activate_idx == 0) {
-            sel = 0;
-            snprintf(menu_status, sizeof(menu_status),
-                     "Connecting to %.80s:%d...", host, port);
-            menu_status_pair = PAIR_INFO;
+        while (!joined) {
+            // Menu
             draw_menu(host, port, player_name, sel, menu_status, menu_status_pair);
 
-            sock_fd = connect_to_server(host, port);
-            if (sock_fd < 0) {
-                snprintf(menu_status, sizeof(menu_status),
-                         "Connect failed: %s", strerror(errno));
-                menu_status_pair = PAIR_STATUS;
-            } else if (send_hello(sock_fd, player_name) != 0) {
-                snprintf(menu_status, sizeof(menu_status),
-                         "HELLO send failed: %s", strerror(errno));
-                menu_status_pair = PAIR_STATUS;
-                close(sock_fd);
-                sock_fd = -1;
-            } else {
-                joined = true;
-                snprintf(menu_status, sizeof(menu_status),
-                         "Connected. Waiting for WELCOME...");
-                menu_status_pair = PAIR_INFO;
+            int ch = getch();
+            if (ch == ERR) {
+                usleep(20000);
+                continue;
             }
-        } else if (activate_idx == 1) {
-            sel = 1;
-            edit_server(host, sizeof(host), &port);
-        } else if (activate_idx == 2) {
-            sel = 2;
-            edit_name(player_name, sizeof(player_name));
-        } else if (activate_idx == 3) {
-            cleanup(0);
+
+            int activate_idx = -1;
+            switch (ch) {
+                case KEY_UP:
+                    sel = (sel + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
+                    break;
+                case KEY_DOWN:
+                    sel = (sel + 1) % MENU_ITEM_COUNT;
+                    break;
+                case '\n':
+                case '\r':
+                case KEY_ENTER:
+                    activate_idx = sel;
+                    break;
+                case 'j': case 'J':
+                    activate_idx = 0;
+                    break;
+                case 'h': case 'H':
+                    activate_idx = 1;
+                    break;
+                case 'n': case 'N':
+                    activate_idx = 2;
+                    break;
+                case 'q': case 'Q':
+                    activate_idx = 3;
+                    break;
+                default:
+                    break;
+            }
+
+            // Joining the server from the menu
+            if (activate_idx == 0) {
+                sel = 0;
+                snprintf(menu_status, sizeof(menu_status), "Connecting to %.80s:%d...", host, port);
+                menu_status_pair = PAIR_INFO;
+                draw_menu(host, port, player_name, sel, menu_status, menu_status_pair);
+
+                sock_fd = connect_to_server(host, port);
+                if (sock_fd < 0) {
+                    snprintf(menu_status, sizeof(menu_status), "Connect failed: %s", strerror(errno));
+                    menu_status_pair = PAIR_STATUS;
+                } else if (send_hello(sock_fd, player_name) != 0) {
+                    snprintf(menu_status, sizeof(menu_status), "HELLO send failed: %s", strerror(errno));
+                    menu_status_pair = PAIR_STATUS;
+                    close(sock_fd);
+                    sock_fd = -1;
+                } else {
+                    joined = true;
+                    snprintf(menu_status, sizeof(menu_status), "Connected. Waiting for WELCOME...");
+                    menu_status_pair = PAIR_INFO;
+                }
+            } else if (activate_idx == 1) {
+                sel = 1;
+                edit_server(host, sizeof(host), &port);
+            } else if (activate_idx == 2) {
+                sel = 2;
+                edit_name(player_name, sizeof(player_name));
+            } else if (activate_idx == 3) {
+                cleanup(0);
+            }
+
+            usleep(20000);
         }
 
-        usleep(20000);
-    }
+        char status[64] = "connected";
+        bool disconnected = false;
+        bool welcome_received = false;
 
-    char status[64] = "connected";
-    bool disconnected = false;
-    bool welcome_received = false;
+        bool had_error = false;
+        time_t hello_sent_at  = time(NULL);
+        time_t last_recv_at   = hello_sent_at;
 
-    bool had_error = false;
-    time_t hello_sent_at  = time(NULL);
-    time_t last_recv_at   = hello_sent_at;
+        time_t pong_pending_since = 0;
 
-    time_t pong_pending_since = 0;
+        // Actions while connected to the server
+        while (!disconnected) {
+            uint8_t buf[BUFFER_SIZE];
+            ssize_t n = poll_recv(sock_fd, (char *)buf, sizeof(buf));
+            if (n > 0) {
+                last_recv_at = time(NULL);
+                pong_pending_since = 0;
+                size_t off = 0;
+                while ((size_t)n - off >= sizeof(msg_generic_t)) {
+                    size_t avail = (size_t)n - off;
+                    const msg_generic_t *hdr = (const msg_generic_t *)(buf + off);
+                    size_t consumed = 0;
 
-    while (running && !disconnected) {
-        uint8_t buf[BUFFER_SIZE];
-        ssize_t n = poll_recv(sock_fd, (char *)buf, sizeof(buf));
-        if (n > 0) {
-            last_recv_at = time(NULL);
-            pong_pending_since = 0;
-            size_t off = 0;
-            while ((size_t)n - off >= sizeof(msg_generic_t)) {
-                size_t avail = (size_t)n - off;
-                const msg_generic_t *hdr =
-                    (const msg_generic_t *)(buf + off);
-                size_t consumed = 0;
-
-                switch (hdr->msg_type) {
-                    case MSG_WELCOME: {
-                        if (avail < sizeof(msg_welcome_t)) goto stop;
-                        const msg_welcome_t *w =
-                            (const msg_welcome_t *)(buf + off);
-                        size_t total = sizeof(msg_welcome_t) +
-                            (size_t)w->length * sizeof(msg_other_client_t);
-                        if (avail < total) goto stop;
-                        my_player_id = hdr->sender_id;
-                        game_state = (game_status_t)w->game_status;
-
-                        match_winner_observed = false;
-                        memset(players, 0, sizeof(players));
-                        if (my_player_id >= 1 &&
-                            my_player_id <= MAX_PLAYERS) {
-                            players[my_player_id].active = true;
-                            players[my_player_id].alive  = true;
-                            players[my_player_id].ready  = me_ready;
-                            snprintf(players[my_player_id].name,
-                                     sizeof(players[my_player_id].name),
-                                     "%s", player_name);
-                        }
-                        const msg_other_client_t *oc =
-                            (const msg_other_client_t *)(buf + off
-                                                  + sizeof(msg_welcome_t));
-                        for (uint8_t k = 0; k < w->length; k++) {
-                            uint8_t id = oc[k].id;
-                            if (id >= 1 && id <= MAX_PLAYERS) {
-                                players[id].active = true;
-                                players[id].alive  = true;
-                                players[id].ready  = oc[k].ready ? true : false;
-                                memcpy(players[id].name, oc[k].name,
-                                       PLAYER_NAME_LEN);
-                                players[id].name[PLAYER_NAME_LEN] = '\0';
+                    switch (hdr->msg_type) {
+                        case MSG_WELCOME: {
+                            if (avail < sizeof(msg_welcome_t)) {
+                                goto stop;
                             }
-                        }
-                        welcome_received = true;
-                        consumed = total;
-                        break;
-                    }
-                    case MSG_HELLO: {
-                        if (avail < sizeof(msg_hello_t)) goto stop;
-                        const msg_hello_t *h =
-                            (const msg_hello_t *)(buf + off);
-                        uint8_t id = hdr->sender_id;
-                        if (id >= 1 && id <= MAX_PLAYERS) {
+                            const msg_welcome_t *w = (const msg_welcome_t *)(buf + off);
+                            size_t total = sizeof(msg_welcome_t) + (size_t)w->length * sizeof(msg_other_client_t);
+                            if (avail < total) {
+                                goto stop;
+                            }
+                            my_player_id = hdr->sender_id;
+                            game_state = (game_status_t)w->game_status;
 
-                            memset(&players[id], 0, sizeof(players[id]));
-                            players[id].active = true;
-                            players[id].alive  = true;
-                            memcpy(players[id].name, h->player_name,
-                                   PLAYER_NAME_LEN);
-                            players[id].name[PLAYER_NAME_LEN] = '\0';
-                        }
-                        consumed = sizeof(msg_hello_t);
-                        break;
-                    }
-                    case MSG_SET_STATUS: {
-                        if (avail < sizeof(msg_set_status_t)) goto stop;
-                        const msg_set_status_t *s =
-                            (const msg_set_status_t *)(buf + off);
-                        game_state = (game_status_t)s->game_status;
-                        if (game_state == GAME_RUNNING) {
-                            last_winner_id = ID_UNKNOWN;
                             match_winner_observed = false;
-                            notif_clear();
-                            for (int k = 1; k <= MAX_PLAYERS; k++) {
-                                if (players[k].active) {
-                                    players[k].alive = true;
-                                    players[k].ready = false;
+                            memset(players, 0, sizeof(players));
+                            if (my_player_id >= 1 && my_player_id <= MAX_PLAYERS) {
+                                players[my_player_id].active = true;
+                                players[my_player_id].alive  = true;
+                                players[my_player_id].ready  = me_ready;
+                                snprintf(players[my_player_id].name, sizeof(players[my_player_id].name),
+                                         "%s", player_name);
+                            }
+                            const msg_other_client_t *oc = (const msg_other_client_t *)(buf + off + sizeof(msg_welcome_t));
+                            for (uint8_t k = 0; k < w->length; k++) {
+                                uint8_t id = oc[k].id;
+                                if (id >= 1 && id <= MAX_PLAYERS) {
+                                    players[id].active = true;
+                                    players[id].alive  = true;
+                                    players[id].ready  = oc[k].ready ? true : false;
+                                    memcpy(players[id].name, oc[k].name, PLAYER_NAME_LEN);
+                                    players[id].name[PLAYER_NAME_LEN] = '\0';
                                 }
                             }
-                            snprintf(status, sizeof(status),
-                                     "Match started!");
-                        } else if (game_state == GAME_LOBBY) {
-                            me_ready = false;
-                            last_winner_id = ID_UNKNOWN;
-                            match_winner_observed = false;
-                            notif_clear();
-                            for (int k = 1; k <= MAX_PLAYERS; k++) {
-                                if (players[k].active) {
-                                    players[k].alive = true;
-                                    players[k].ready = false;
-                                }
-                            }
-                            snprintf(status, sizeof(status),
-                                     "Back to lobby");
-                        } else if (game_state == GAME_END) {
-                            snprintf(status, sizeof(status),
-                                     "Match ended");
-                        }
-                        consumed = sizeof(msg_set_status_t);
-                        break;
-                    }
-                    case MSG_SET_READY: {
-                        uint8_t id = hdr->sender_id;
-                        if (id >= 1 && id <= MAX_PLAYERS) {
-                            players[id].ready = true;
-                        }
-                        if (id == my_player_id) me_ready = true;
-                        consumed = sizeof(msg_generic_t);
-                        break;
-                    }
-                    case MSG_SET_NOT_READY: {
-                        uint8_t id = hdr->sender_id;
-                        if (id >= 1 && id <= MAX_PLAYERS) {
-                            players[id].ready = false;
-                        }
-                        if (id == my_player_id) me_ready = false;
-                        consumed = sizeof(msg_generic_t);
-                        break;
-                    }
-                    case MSG_PING:
-                        send_pong(sock_fd);
-                        consumed = sizeof(msg_generic_t);
-                        break;
-                    case MSG_PONG:
-                        consumed = sizeof(msg_generic_t);
-                        break;
-                    case MSG_DISCONNECT:
-                        disconnected = true;
-
-                        if (!had_error) {
-                            snprintf(status, sizeof(status),
-                                     "server requested disconnect");
-                        }
-                        consumed = sizeof(msg_generic_t);
-                        break;
-                    case MSG_LEAVE: {
-                        uint8_t id = hdr->sender_id;
-                        if (id >= 1 && id <= MAX_PLAYERS) {
-                            players[id].active = false;
-                            players[id].alive  = false;
-                        }
-                        consumed = sizeof(msg_generic_t);
-                        break;
-                    }
-                    case MSG_ERROR: {
-                        if (avail < sizeof(msg_generic_t) + 2) goto stop;
-                        uint16_t elen =
-                            ((uint16_t)(buf + off)[sizeof(msg_generic_t)] << 8) |
-                            (buf + off)[sizeof(msg_generic_t) + 1];
-                        size_t total = sizeof(msg_generic_t) + 2 + elen;
-                        if (avail < total) goto stop;
-                        size_t copy = elen < sizeof(status) - 1
-                                      ? elen : sizeof(status) - 1;
-                        snprintf(status, sizeof(status),
-                                 "%.*s", (int)copy,
-                                 (const char *)(buf + off +
-                                                sizeof(msg_generic_t) + 2));
-                        had_error = true;
-                        consumed = total;
-                        break;
-                    }
-                    case MSG_MAP: {
-                        if (avail < sizeof(msg_map_t)) goto stop;
-                        const msg_map_t *m = (const msg_map_t *)(buf + off);
-                        if (m->H == 0 || m->W == 0) {
-                            consumed = sizeof(msg_map_t);
-                            break;
-                        }
-                        size_t need = (size_t)m->H * m->W;
-                        size_t total = sizeof(msg_map_t) + need;
-                        if (avail < total) goto stop;
-                        level_config_t tmp = {0};
-                        tmp.rows = m->H;
-                        tmp.cols = m->W;
-                        tmp.cells =
-                            (cell_t *)calloc(need, sizeof(cell_t));
-                        if (!tmp.cells) {
+                            welcome_received = true;
                             consumed = total;
                             break;
                         }
-                        bool ok = true;
-                        for (size_t i = 0; i < need; i++) {
-                            if (!level_parse_cell(
-                                    (char)(buf + off)[sizeof(*m) + i],
-                                    &tmp.cells[i])) {
-                                ok = false; break;
+                        case MSG_HELLO: {
+                            if (avail < sizeof(msg_hello_t)) {
+                                goto stop;
                             }
+                            const msg_hello_t *h = (const msg_hello_t *)(buf + off);
+                            uint8_t id = hdr->sender_id;
+                            if (id >= 1 && id <= MAX_PLAYERS) {
+                                memset(&players[id], 0, sizeof(players[id]));
+                                players[id].active = true;
+                                players[id].alive  = true;
+                                memcpy(players[id].name, h->player_name, PLAYER_NAME_LEN);
+                                players[id].name[PLAYER_NAME_LEN] = '\0';
+                            }
+                            consumed = sizeof(msg_hello_t);
+                            break;
                         }
-                        if (ok) {
-                            bool seed_positions =
-                                (game_state != GAME_RUNNING);
-                            for (size_t i = 0; i < need; i++) {
-                                if (tmp.cells[i].type == CELL_PLAYER_START) {
-                                    uint8_t pid = tmp.cells[i].player_id;
-                                    if (seed_positions &&
-                                        pid >= 1 && pid <= MAX_PLAYERS &&
-                                        players[pid].active) {
-                                        players[pid].row =
-                                            (uint16_t)(i / m->W);
-                                        players[pid].col =
-                                            (uint16_t)(i % m->W);
-                                        players[pid].alive = true;
+                        case MSG_SET_STATUS: {
+                            if (avail < sizeof(msg_set_status_t)) {
+                                goto stop;
+                            }
+                            const msg_set_status_t *s = (const msg_set_status_t *)(buf + off);
+                            game_state = (game_status_t)s->game_status;
+                            if (game_state == GAME_RUNNING) {
+                                last_winner_id = ID_UNKNOWN;
+                                match_winner_observed = false;
+                                notif_clear();
+                                for (int k = 1; k <= MAX_PLAYERS; k++) {
+                                    if (players[k].active) {
+                                        players[k].alive = true;
+                                        players[k].ready = false;
                                     }
-                                    tmp.cells[i].type = CELL_EMPTY;
-                                    tmp.cells[i].player_id = 0;
                                 }
+                                snprintf(status, sizeof(status), "Match started!");
+                            } else if (game_state == GAME_LOBBY) {
+                                me_ready = false;
+                                last_winner_id = ID_UNKNOWN;
+                                match_winner_observed = false;
+                                notif_clear();
+                                for (int k = 1; k <= MAX_PLAYERS; k++) {
+                                    if (players[k].active) {
+                                        players[k].alive = true;
+                                        players[k].ready = false;
+                                    }
+                                }
+                                snprintf(status, sizeof(status), "Back to lobby");
+                            } else if (game_state == GAME_END) {
+                                snprintf(status, sizeof(status), "Match ended");
                             }
-                            level_config_free(&level_cfg);
-                            level_cfg = tmp;
-                            level_cfg_loaded = true;
-                            snprintf(status, sizeof(status),
-                                     "Map ready (press [m])");
-                        } else {
-                            free(tmp.cells);
-                            snprintf(status, sizeof(status),
-                                     "MAP parse error");
+                            consumed = sizeof(msg_set_status_t);
+                            break;
                         }
-                        consumed = total;
-                        break;
-                    }
-                    case MSG_MOVED: {
-                        if (avail < sizeof(msg_moved_t)) goto stop;
-                        const msg_moved_t *mv =
-                            (const msg_moved_t *)(buf + off);
-                        uint16_t coord = ntohs(mv->coord);
-                        if (level_cfg_loaded && level_cfg.cols > 0 &&
-                            mv->player_id >= 1 &&
-                            mv->player_id <= MAX_PLAYERS) {
-                            uint16_t r, c;
-                            split_cell_index(coord, level_cfg.cols, &r, &c);
-                            players[mv->player_id].active = true;
-                            players[mv->player_id].alive  = true;
-                            players[mv->player_id].row    = r;
-                            players[mv->player_id].col    = c;
+                        case MSG_SET_READY: {
+                            uint8_t id = hdr->sender_id;
+                            if (id >= 1 && id <= MAX_PLAYERS) {
+                                players[id].ready = true;
+                            }
+                            if (id == my_player_id) {
+                                me_ready = true;
+                            }
+                            consumed = sizeof(msg_generic_t);
+                            break;
                         }
-                        consumed = sizeof(msg_moved_t);
-                        break;
-                    }
-                    case MSG_DEATH: {
-                        if (avail < sizeof(msg_death_t)) goto stop;
-                        const msg_death_t *d =
-                            (const msg_death_t *)(buf + off);
-                        if (d->player_id >= 1 &&
-                            d->player_id <= MAX_PLAYERS) {
-                            players[d->player_id].alive = false;
+                        case MSG_SET_NOT_READY: {
+                            uint8_t id = hdr->sender_id;
+                            if (id >= 1 && id <= MAX_PLAYERS) {
+                                players[id].ready = false;
+                            }
+                            if (id == my_player_id) {
+                                me_ready = false;
+                            }
+                            consumed = sizeof(msg_generic_t);
+                            break;
                         }
-                        if (d->player_id == my_player_id) {
-                            snprintf(status, sizeof(status),
-                                     "You died!");
-                        }
+                        case MSG_PING:
+                            send_pong(sock_fd);
+                            consumed = sizeof(msg_generic_t);
+                            break;
+                        case MSG_PONG:
+                            consumed = sizeof(msg_generic_t);
+                            break;
+                        case MSG_DISCONNECT:
+                            disconnected = true;
 
-                        notif_push("%s died", player_label(d->player_id));
-                        consumed = sizeof(msg_death_t);
-                        break;
-                    }
-                    case MSG_WINNER: {
-                        if (avail < sizeof(msg_winner_t)) goto stop;
-                        const msg_winner_t *w =
-                            (const msg_winner_t *)(buf + off);
-                        last_winner_id = w->winner_id;
-                        match_winner_observed = true;
-                        const char *wname =
-                            (w->winner_id >= 1 &&
-                             w->winner_id <= MAX_PLAYERS &&
-                             players[w->winner_id].name[0])
-                                ? players[w->winner_id].name : NULL;
-                        if (w->winner_id == ID_UNKNOWN) {
-                            snprintf(status, sizeof(status),
-                                     "Draw - no survivors");
-                        } else if (w->winner_id == my_player_id) {
-                            snprintf(status, sizeof(status),
-                                     "You won!");
-                        } else if (wname) {
-                            snprintf(status, sizeof(status),
-                                     "%s won", wname);
-                        } else {
-                            snprintf(status, sizeof(status),
-                                     "Player %u won", w->winner_id);
-                        }
-                        consumed = sizeof(msg_winner_t);
-                        break;
-                    }
-                    case MSG_BOMB: {
-                        if (avail < sizeof(msg_bomb_t)) goto stop;
-                        const msg_bomb_t *b =
-                            (const msg_bomb_t *)(buf + off);
-                        uint16_t coord = ntohs(b->cell);
-                        if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t r, c;
-                            split_cell_index(coord, level_cfg.cols, &r, &c);
-                            if (r < level_cfg.rows && c < level_cfg.cols) {
-                                cell_t *cl =
-                                    level_cell_at(&level_cfg, r, c);
-                                cl->type = CELL_BOMB;
-                                cl->player_id = b->player_id;
+                            if (!had_error) {
+                                snprintf(status, sizeof(status), "server requested disconnect");
                             }
+                            consumed = sizeof(msg_generic_t);
+                            break;
+                        case MSG_LEAVE: {
+                            uint8_t id = hdr->sender_id;
+                            if (id >= 1 && id <= MAX_PLAYERS) {
+                                players[id].active = false;
+                                players[id].alive  = false;
+                            }
+                            consumed = sizeof(msg_generic_t);
+                            break;
                         }
-                        consumed = sizeof(msg_bomb_t);
-                        break;
-                    }
-                    case MSG_EXPLOSION_START: {
-                        if (avail < sizeof(msg_explosion_t)) goto stop;
-                        const msg_explosion_t *e =
-                            (const msg_explosion_t *)(buf + off);
-                        uint16_t coord = ntohs(e->cell);
-                        if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t br16, bc16;
-                            split_cell_index(coord, level_cfg.cols,
-                                             &br16, &bc16);
-                            int br = (int)br16, bc = (int)bc16;
-                            cell_t *cell0 =
-                                level_cell_at(&level_cfg, br, bc);
-                            cell0->type = CELL_EXPLOSION;
-                            static const uint8_t dirs[] = {
-                                DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
-                            for (int d = 0; d < 4; d++) {
-                                int dr, dc;
-                                dir_delta(dirs[d], &dr, &dc);
-                                for (int dist = 1;
-                                     dist <= e->radius; dist++) {
-                                    int rr = br + dr * dist;
-                                    int cc = bc + dc * dist;
-                                    if (rr < 0 || rr >= level_cfg.rows ||
-                                        cc < 0 || cc >= level_cfg.cols)
-                                        break;
-                                    cell_t *cl =
-                                        level_cell_at(&level_cfg, rr, cc);
-                                    if (cl->type == CELL_HARD_BLOCK) break;
-                                    bool soft =
-                                        (cl->type == CELL_SOFT_BLOCK);
-                                    cl->type = CELL_EXPLOSION;
-                                    if (soft) break;
+                        case MSG_ERROR: {
+                            if (avail < sizeof(msg_generic_t) + 2) {
+                                goto stop;
+                            }
+                            uint16_t elen = ((uint16_t)(buf + off)[sizeof(msg_generic_t)] << 8) | (buf + off)[sizeof(msg_generic_t) + 1];
+                            size_t total = sizeof(msg_generic_t) + 2 + elen;
+                            if (avail < total) {
+                                goto stop;
+                            }
+                            size_t copy = elen < sizeof(status) - 1 ? elen : sizeof(status) - 1;
+                            snprintf(status, sizeof(status), "%.*s", (int)copy, (const char *)(buf + off + sizeof(msg_generic_t) + 2));
+                            had_error = true;
+                            consumed = total;
+                            break;
+                        }
+                        case MSG_MAP: {
+                            if (avail < sizeof(msg_map_t)) {
+                                goto stop;
+                            }
+                            const msg_map_t *m = (const msg_map_t *)(buf + off);
+                            if (m->H == 0 || m->W == 0) {
+                                consumed = sizeof(msg_map_t);
+                                break;
+                            }
+                            size_t need = (size_t)m->H * m->W;
+                            size_t total = sizeof(msg_map_t) + need;
+                            if (avail < total) {
+                                goto stop;
+                            }
+                            level_config_t tmp = {0};
+                            tmp.rows = m->H;
+                            tmp.cols = m->W;
+                            tmp.cells = (cell_t *)calloc(need, sizeof(cell_t));
+                            if (!tmp.cells) {
+                                consumed = total;
+                                break;
+                            }
+                            bool ok = true;
+                            for (size_t i = 0; i < need; i++) {
+                                if (!level_parse_cell((char)(buf + off)[sizeof(*m) + i], &tmp.cells[i])) {
+                                    ok = false;
+                                    break;
                                 }
                             }
+                            if (ok) {
+                                bool seed_positions = (game_state != GAME_RUNNING);
+                                for (size_t i = 0; i < need; i++) {
+                                    if (tmp.cells[i].type == CELL_PLAYER_START) {
+                                        uint8_t pid = tmp.cells[i].player_id;
+                                        if (seed_positions && pid >= 1 && pid <= MAX_PLAYERS && players[pid].active) {
+                                            players[pid].row = (uint16_t)(i / m->W);
+                                            players[pid].col = (uint16_t)(i % m->W);
+                                            players[pid].alive = true;
+                                        }
+                                        tmp.cells[i].type = CELL_EMPTY;
+                                        tmp.cells[i].player_id = 0;
+                                    }
+                                }
+                                level_config_free(&level_cfg);
+                                level_cfg = tmp;
+                                level_cfg_loaded = true;
+                                snprintf(status, sizeof(status), "Map ready (press [m])");
+                            } else {
+                                free(tmp.cells);
+                                snprintf(status, sizeof(status), "MAP parse error");
+                            }
+                            consumed = total;
+                            break;
                         }
-                        consumed = sizeof(msg_explosion_t);
-                        break;
-                    }
-                    case MSG_EXPLOSION_END: {
-                        if (avail < sizeof(msg_explosion_t)) goto stop;
-                        const msg_explosion_t *e =
-                            (const msg_explosion_t *)(buf + off);
-                        uint16_t coord = ntohs(e->cell);
-                        if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t br16, bc16;
-                            split_cell_index(coord, level_cfg.cols,
-                                             &br16, &bc16);
-                            int br = (int)br16, bc = (int)bc16;
-                            cell_t *cell0 =
-                                level_cell_at(&level_cfg, br, bc);
-                            if (cell0->type == CELL_EXPLOSION)
-                                cell0->type = CELL_EMPTY;
-                            static const uint8_t dirs[] = {
-                                DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
-                            for (int d = 0; d < 4; d++) {
-                                int dr, dc;
-                                dir_delta(dirs[d], &dr, &dc);
-                                for (int dist = 1;
-                                     dist <= e->radius; dist++) {
-                                    int rr = br + dr * dist;
-                                    int cc = bc + dc * dist;
-                                    if (rr < 0 || rr >= level_cfg.rows ||
-                                        cc < 0 || cc >= level_cfg.cols)
-                                        break;
-                                    cell_t *cl =
-                                        level_cell_at(&level_cfg, rr, cc);
-                                    if (cl->type == CELL_HARD_BLOCK) break;
-                                    if (cl->type == CELL_EXPLOSION)
+                        case MSG_MOVED: {
+                            if (avail < sizeof(msg_moved_t)) {
+                                goto stop;
+                            }
+                            const msg_moved_t *mv = (const msg_moved_t *)(buf + off);
+                            uint16_t coord = ntohs(mv->coord);
+                            if (level_cfg_loaded && level_cfg.cols > 0 && mv->player_id >= 1 && mv->player_id <= MAX_PLAYERS) {
+                                uint16_t r, c;
+                                split_cell_index(coord, level_cfg.cols, &r, &c);
+                                players[mv->player_id].active = true;
+                                players[mv->player_id].alive  = true;
+                                players[mv->player_id].row    = r;
+                                players[mv->player_id].col    = c;
+                            }
+                            consumed = sizeof(msg_moved_t);
+                            break;
+                        }
+                        case MSG_DEATH: {
+                            if (avail < sizeof(msg_death_t)) {
+                                goto stop;
+                            }
+                            const msg_death_t *d = (const msg_death_t *)(buf + off);
+                            if (d->player_id >= 1 && d->player_id <= MAX_PLAYERS) {
+                                players[d->player_id].alive = false;
+                            }
+                            if (d->player_id == my_player_id) {
+                                snprintf(status, sizeof(status), "You died!");
+                            }
+
+                            notif_push("%s died", player_label(d->player_id));
+                            consumed = sizeof(msg_death_t);
+                            break;
+                        }
+                        case MSG_WINNER: {
+                            if (avail < sizeof(msg_winner_t)) {
+                                goto stop;
+                            }
+                            const msg_winner_t *w = (const msg_winner_t *)(buf + off);
+                            last_winner_id = w->winner_id;
+                            match_winner_observed = true;
+                            const char *wname = (w->winner_id >= 1 && w->winner_id <= MAX_PLAYERS && players[w->winner_id].name[0]) ? players[w->winner_id].name : NULL;
+                            if (w->winner_id == ID_UNKNOWN) {
+                                snprintf(status, sizeof(status), "Draw - no survivors");
+                            } else if (w->winner_id == my_player_id) {
+                                snprintf(status, sizeof(status), "You won!");
+                            } else if (wname) {
+                                snprintf(status, sizeof(status), "%s won", wname);
+                            } else {
+                                snprintf(status, sizeof(status), "Player %u won", w->winner_id);
+                            }
+                            consumed = sizeof(msg_winner_t);
+                            break;
+                        }
+                        case MSG_BOMB: {
+                            if (avail < sizeof(msg_bomb_t)) {
+                                goto stop;
+                            }
+                            const msg_bomb_t *b = (const msg_bomb_t *)(buf + off);
+                            uint16_t coord = ntohs(b->cell);
+                            if (level_cfg_loaded && level_cfg.cols > 0) {
+                                uint16_t r, c;
+                                split_cell_index(coord, level_cfg.cols, &r, &c);
+                                if (r < level_cfg.rows && c < level_cfg.cols) {
+                                    cell_t *cl = level_cell_at(&level_cfg, r, c);
+                                    cl->type = CELL_BOMB;
+                                    cl->player_id = b->player_id;
+                                }
+                            }
+                            consumed = sizeof(msg_bomb_t);
+                            break;
+                        }
+                        case MSG_EXPLOSION_START: {
+                            if (avail < sizeof(msg_explosion_t)) {
+                                goto stop;
+                            }
+                            const msg_explosion_t *e = (const msg_explosion_t *)(buf + off);
+                            uint16_t coord = ntohs(e->cell);
+                            if (level_cfg_loaded && level_cfg.cols > 0) {
+                                uint16_t br16, bc16;
+                                split_cell_index(coord, level_cfg.cols, &br16, &bc16);
+                                int br = (int)br16, bc = (int)bc16;
+                                cell_t *cell0 = level_cell_at(&level_cfg, br, bc);
+                                cell0->type = CELL_EXPLOSION;
+                                static const uint8_t dirs[] = {
+                                    DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
+                                for (int d = 0; d < 4; d++) {
+                                    int dr, dc;
+                                    dir_delta(dirs[d], &dr, &dc);
+                                    for (int dist = 1; dist <= e->radius; dist++) {
+                                        int rr = br + dr * dist;
+                                        int cc = bc + dc * dist;
+                                        if (rr < 0 || rr >= level_cfg.rows ||
+                                            cc < 0 || cc >= level_cfg.cols) {
+                                            break;
+                                        }
+                                        cell_t *cl = level_cell_at(&level_cfg, rr, cc);
+                                        if (cl->type == CELL_HARD_BLOCK) {
+                                            break;
+                                        }
+                                        bool soft = (cl->type == CELL_SOFT_BLOCK);
+                                        cl->type = CELL_EXPLOSION;
+                                        if (soft) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            consumed = sizeof(msg_explosion_t);
+                            break;
+                        }
+                        case MSG_EXPLOSION_END: {
+                            if (avail < sizeof(msg_explosion_t)) {
+                                goto stop;
+                            }
+                            const msg_explosion_t *e = (const msg_explosion_t *)(buf + off);
+                            uint16_t coord = ntohs(e->cell);
+                            if (level_cfg_loaded && level_cfg.cols > 0) {
+                                uint16_t br16, bc16;
+                                split_cell_index(coord, level_cfg.cols, &br16, &bc16);
+                                int br = (int)br16, bc = (int)bc16;
+                                cell_t *cell0 = level_cell_at(&level_cfg, br, bc);
+                                if (cell0->type == CELL_EXPLOSION) {
+                                    cell0->type = CELL_EMPTY;
+                                }
+                                static const uint8_t dirs[] = {
+                                    DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
+                                for (int d = 0; d < 4; d++) {
+                                    int dr, dc;
+                                    dir_delta(dirs[d], &dr, &dc);
+                                    for (int dist = 1; dist <= e->radius; dist++) {
+                                        int rr = br + dr * dist;
+                                        int cc = bc + dc * dist;
+                                        if (rr < 0 || rr >= level_cfg.rows ||
+                                            cc < 0 || cc >= level_cfg.cols) {
+                                            break;
+                                        }
+                                        cell_t *cl = level_cell_at(&level_cfg, rr, cc);
+                                        if (cl->type == CELL_HARD_BLOCK) {
+                                            break;
+                                        }
+                                        if (cl->type == CELL_EXPLOSION) {
+                                            cl->type = CELL_EMPTY;
+                                        }
+                                    }
+                                }
+                            }
+                            consumed = sizeof(msg_explosion_t);
+                            break;
+                        }
+                        case MSG_BLOCK_DESTROYED: {
+                            if (avail < sizeof(msg_block_destroyed_t)) {
+                                goto stop;
+                            }
+                            const msg_block_destroyed_t *bd = (const msg_block_destroyed_t *)(buf + off);
+                            uint16_t coord = ntohs(bd->cell);
+                            if (level_cfg_loaded && level_cfg.cols > 0) {
+                                uint16_t r, c;
+                                split_cell_index(coord, level_cfg.cols, &r, &c);
+                                if (r < level_cfg.rows && c < level_cfg.cols) {
+                                    cell_t *cl = level_cell_at(&level_cfg, r, c);
+                                    if (cl->type != CELL_EXPLOSION) {
                                         cl->type = CELL_EMPTY;
+                                        cl->player_id = 0;
+                                    }
                                 }
                             }
+                            consumed = sizeof(msg_block_destroyed_t);
+                            break;
                         }
-                        consumed = sizeof(msg_explosion_t);
-                        break;
-                    }
-                    case MSG_BLOCK_DESTROYED: {
-                        if (avail < sizeof(msg_block_destroyed_t)) goto stop;
-                        const msg_block_destroyed_t *bd =
-                            (const msg_block_destroyed_t *)(buf + off);
-                        uint16_t coord = ntohs(bd->cell);
-                        if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t r, c;
-                            split_cell_index(coord, level_cfg.cols, &r, &c);
-                            if (r < level_cfg.rows && c < level_cfg.cols) {
-                                cell_t *cl =
-                                    level_cell_at(&level_cfg, r, c);
-                                if (cl->type != CELL_EXPLOSION) {
+                        case MSG_BONUS_AVAILABLE: {
+                            if (avail < sizeof(msg_bonus_available_t)) {
+                                goto stop;
+                            }
+                            const msg_bonus_available_t *bn = (const msg_bonus_available_t *)(buf + off);
+                            uint16_t coord = ntohs(bn->cell);
+                            if (level_cfg_loaded && level_cfg.cols > 0) {
+                                uint16_t r, c;
+                                split_cell_index(coord, level_cfg.cols, &r, &c);
+                                if (r < level_cfg.rows && c < level_cfg.cols) {
+                                    cell_t *cl = level_cell_at(&level_cfg, r, c);
+                                    switch (bn->bonus_type) {
+                                        case BONUS_SPEED:
+                                            cl->type = CELL_BONUS_SPEED;  break;
+                                        case BONUS_RADIUS:
+                                            cl->type = CELL_BONUS_RADIUS; break;
+                                        case BONUS_TIMER:
+                                            cl->type = CELL_BONUS_TIMER;  break;
+                                        case BONUS_BOMBS:
+                                            cl->type = CELL_BONUS_BOMBS;  break;
+                                        default: break;
+                                    }
+                                }
+                            }
+                            consumed = sizeof(msg_bonus_available_t);
+                            break;
+                        }
+                        case MSG_MAP_LIST: {
+                            if (avail < sizeof(msg_map_list_t)) {
+                                goto stop;
+                            }
+                            const msg_map_list_t *ml = (const msg_map_list_t *)(buf + off);
+                            size_t total = sizeof(msg_map_list_t) + (size_t)ml->count * sizeof(msg_map_entry_t);
+                            if (avail < total) {
+                                goto stop;
+                            }
+                            int n = ml->count;
+                            if (n > MAP_PICKER_MAX) {
+                                n = MAP_PICKER_MAX;
+                            }
+                            const msg_map_entry_t *src = (const msg_map_entry_t *)(buf + off + sizeof(msg_map_list_t));
+                            for (int i = 0; i < n; i++) {
+                                memcpy(map_picker_entries[i].name, src[i].name, MAP_NAME_LEN);
+                                map_picker_entries[i].name[MAP_NAME_LEN - 1] = '\0';
+                                map_picker_entries[i].rows        = src[i].rows;
+                                map_picker_entries[i].cols        = src[i].cols;
+                                map_picker_entries[i].max_players = src[i].max_players;
+                            }
+                            map_picker_count = n;
+                            map_picker_sel   = 0;
+                            map_picker_open  = (n > 0);
+                            map_list_pending = false;
+                            if (n == 0) {
+                                snprintf(status, sizeof(status), "Server has no maps");
+                            }
+                            consumed = total;
+                            break;
+                        }
+                        case MSG_SYNC_BOARD: {
+                            if (avail < sizeof(msg_sync_board_t)) {
+                                goto stop;
+                            }
+                            const msg_sync_board_t *sb = (const msg_sync_board_t *)(buf + off);
+                            uint8_t pid = sb->player_id;
+                            if (pid >= 1 && pid <= MAX_PLAYERS) {
+                                players[pid].active             = true;
+                                players[pid].alive              = sb->alive ? true : false;
+                                players[pid].lives              = sb->lives;
+                                players[pid].row                = ntohs(sb->row);
+                                players[pid].col                = ntohs(sb->col);
+                                players[pid].bomb_count         = sb->bomb_count;
+                                players[pid].bomb_radius        = sb->bomb_radius;
+                                players[pid].bomb_timer_ticks   = ntohs(sb->bomb_timer_ticks);
+                                players[pid].speed              = ntohs(sb->speed);
+                            }
+                            consumed = sizeof(msg_sync_board_t);
+                            break;
+                        }
+                        case MSG_BONUS_RETRIEVED: {
+                            if (avail < sizeof(msg_bonus_retrieved_t)) {
+                                goto stop;
+                            }
+                            const msg_bonus_retrieved_t *br = (const msg_bonus_retrieved_t *)(buf + off);
+                            uint16_t coord = ntohs(br->cell);
+                            if (level_cfg_loaded && level_cfg.cols > 0) {
+                                uint16_t r, c;
+                                split_cell_index(coord, level_cfg.cols, &r, &c);
+                                if (r < level_cfg.rows && c < level_cfg.cols) {
+                                    cell_t *cl = level_cell_at(&level_cfg, r, c);
+                                    const char *bname = NULL;
+                                    switch (cl->type) {
+                                        case CELL_BONUS_SPEED:
+                                            bname = "Speed +1";  break;
+                                        case CELL_BONUS_RADIUS:
+                                            bname = "Radius +1"; break;
+                                        case CELL_BONUS_TIMER:
+                                            bname = "Timer +10t";break;
+                                        case CELL_BONUS_BOMBS:
+                                            bname = "Bombs +1";  break;
+                                        default: break;
+                                    }
+                                    if (bname) {
+                                        notif_push("%s picked up %s", player_label(br->player_id), bname);
+                                    }
                                     cl->type = CELL_EMPTY;
                                     cl->player_id = 0;
                                 }
                             }
+                            consumed = sizeof(msg_bonus_retrieved_t);
+                            break;
                         }
-                        consumed = sizeof(msg_block_destroyed_t);
+                        default:
+                            consumed = sizeof(msg_generic_t);
+                            break;
+                    }
+                    if (consumed == 0) {
                         break;
                     }
-                    case MSG_BONUS_AVAILABLE: {
-                        if (avail < sizeof(msg_bonus_available_t)) goto stop;
-                        const msg_bonus_available_t *bn =
-                            (const msg_bonus_available_t *)(buf + off);
-                        uint16_t coord = ntohs(bn->cell);
-                        if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t r, c;
-                            split_cell_index(coord, level_cfg.cols, &r, &c);
-                            if (r < level_cfg.rows && c < level_cfg.cols) {
-                                cell_t *cl =
-                                    level_cell_at(&level_cfg, r, c);
-                                switch (bn->bonus_type) {
-                                    case BONUS_SPEED:
-                                        cl->type = CELL_BONUS_SPEED;  break;
-                                    case BONUS_RADIUS:
-                                        cl->type = CELL_BONUS_RADIUS; break;
-                                    case BONUS_TIMER:
-                                        cl->type = CELL_BONUS_TIMER;  break;
-                                    case BONUS_BOMBS:
-                                        cl->type = CELL_BONUS_BOMBS;  break;
-                                    default: break;
-                                }
-                            }
-                        }
-                        consumed = sizeof(msg_bonus_available_t);
-                        break;
-                    }
-                    case MSG_MAP_LIST: {
-                        if (avail < sizeof(msg_map_list_t)) goto stop;
-                        const msg_map_list_t *ml =
-                            (const msg_map_list_t *)(buf + off);
-                        size_t total = sizeof(msg_map_list_t) +
-                            (size_t)ml->count * sizeof(msg_map_entry_t);
-                        if (avail < total) goto stop;
-                        int n = ml->count;
-                        if (n > MAP_PICKER_MAX) n = MAP_PICKER_MAX;
-                        const msg_map_entry_t *src =
-                            (const msg_map_entry_t *)(buf + off
-                                                + sizeof(msg_map_list_t));
-                        for (int i = 0; i < n; i++) {
-                            memcpy(map_picker_entries[i].name, src[i].name,
-                                   MAP_NAME_LEN);
-                            map_picker_entries[i].name[MAP_NAME_LEN - 1]
-                                = '\0';
-                            map_picker_entries[i].rows        = src[i].rows;
-                            map_picker_entries[i].cols        = src[i].cols;
-                            map_picker_entries[i].max_players =
-                                src[i].max_players;
-                        }
-                        map_picker_count = n;
-                        map_picker_sel   = 0;
-                        map_picker_open  = (n > 0);
-                        map_list_pending = false;
-                        if (n == 0) {
-                            snprintf(status, sizeof(status),
-                                     "Server has no maps");
-                        }
-                        consumed = total;
-                        break;
-                    }
-                    case MSG_SYNC_BOARD: {
-                        if (avail < sizeof(msg_sync_board_t)) goto stop;
-                        const msg_sync_board_t *sb =
-                            (const msg_sync_board_t *)(buf + off);
-                        uint8_t pid = sb->player_id;
-                        if (pid >= 1 && pid <= MAX_PLAYERS) {
-                            players[pid].active             = true;
-                            players[pid].alive              = sb->alive ? true : false;
-                            players[pid].lives              = sb->lives;
-                            players[pid].row                = ntohs(sb->row);
-                            players[pid].col                = ntohs(sb->col);
-                            players[pid].bomb_count         = sb->bomb_count;
-                            players[pid].bomb_radius        = sb->bomb_radius;
-                            players[pid].bomb_timer_ticks   = ntohs(sb->bomb_timer_ticks);
-                            players[pid].speed              = ntohs(sb->speed);
-                        }
-                        consumed = sizeof(msg_sync_board_t);
-                        break;
-                    }
-                    case MSG_BONUS_RETRIEVED: {
-                        if (avail < sizeof(msg_bonus_retrieved_t)) goto stop;
-                        const msg_bonus_retrieved_t *br =
-                            (const msg_bonus_retrieved_t *)(buf + off);
-                        uint16_t coord = ntohs(br->cell);
-                        if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t r, c;
-                            split_cell_index(coord, level_cfg.cols, &r, &c);
-                            if (r < level_cfg.rows && c < level_cfg.cols) {
-                                cell_t *cl =
-                                    level_cell_at(&level_cfg, r, c);
-                                const char *bname = NULL;
-                                switch (cl->type) {
-                                    case CELL_BONUS_SPEED:
-                                        bname = "Speed +1";  break;
-                                    case CELL_BONUS_RADIUS:
-                                        bname = "Radius +1"; break;
-                                    case CELL_BONUS_TIMER:
-                                        bname = "Timer +10t";break;
-                                    case CELL_BONUS_BOMBS:
-                                        bname = "Bombs +1";  break;
-                                    default: break;
-                                }
-                                if (bname) {
-                                    notif_push("%s picked up %s",
-                                               player_label(br->player_id),
-                                               bname);
-                                }
-                                cl->type = CELL_EMPTY;
-                                cl->player_id = 0;
-                            }
-                        }
-                        consumed = sizeof(msg_bonus_retrieved_t);
-                        break;
-                    }
-                    default:
-                        consumed = sizeof(msg_generic_t);
-                        break;
+                    off += consumed;
                 }
-                if (consumed == 0) break;
-                off += consumed;
-            }
-            stop: ;
-        } else if (n == 0) {
-            disconnected = true;
-            if (!had_error) {
-                snprintf(status, sizeof(status),
-                         "server closed connection");
-            }
-        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            disconnected = true;
-            if (!had_error) {
-                snprintf(status, sizeof(status),
-                         "recv error: %s", strerror(errno));
-            }
-        }
-
-        if (!disconnected) {
-            time_t now = time(NULL);
-            if (!welcome_received &&
-                now - hello_sent_at > WELCOME_TIMEOUT_SEC) {
+                stop: ;
+            } else if (n == 0) {
                 disconnected = true;
                 if (!had_error) {
-                    snprintf(status, sizeof(status),
-                             "no WELCOME within %ds - giving up",
-                             WELCOME_TIMEOUT_SEC);
+                    snprintf(status, sizeof(status), "server closed connection");
                 }
-            } else if (welcome_received) {
-                if (pong_pending_since != 0 &&
-                    now - pong_pending_since > PONG_TIMEOUT_SEC) {
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                disconnected = true;
+                if (!had_error) {
+                    snprintf(status, sizeof(status), "recv error: %s", strerror(errno));
+                }
+            }
+
+            if (!disconnected) {
+                time_t now = time(NULL);
+                if (!welcome_received && now - hello_sent_at > WELCOME_TIMEOUT_SEC) {
                     disconnected = true;
                     if (!had_error) {
-                        snprintf(status, sizeof(status),
-                                 "no PONG within %ds - peer timeout",
-                                 PONG_TIMEOUT_SEC);
+                        snprintf(status, sizeof(status), "no WELCOME within %ds - giving up", WELCOME_TIMEOUT_SEC);
                     }
-                } else if (pong_pending_since == 0 &&
-                           now - last_recv_at > IDLE_BEFORE_PING_SEC) {
-                    if (send_ping(sock_fd) == 0) {
-                        pong_pending_since = now;
+                } else if (welcome_received) {
+                    if (pong_pending_since != 0 && now - pong_pending_since > PONG_TIMEOUT_SEC) {
+                        disconnected = true;
+                        if (!had_error) {
+                            snprintf(status, sizeof(status), "no PONG within %ds - peer timeout", PONG_TIMEOUT_SEC);
+                        }
+                    } else if (pong_pending_since == 0 && now - last_recv_at > IDLE_BEFORE_PING_SEC) {
+                        if (send_ping(sock_fd) == 0) {
+                            pong_pending_since = now;
+                        }
                     }
                 }
             }
-        }
 
-        draw_ui(host, port, player_name, status);
+            draw_ui(host, port, player_name, status);
 
-        int ch = getch();
-        if (map_picker_open) {
-            if (ch == KEY_UP) {
-                if (map_picker_sel > 0) map_picker_sel--;
-            } else if (ch == KEY_DOWN) {
-                if (map_picker_sel + 1 < map_picker_count) map_picker_sel++;
-            } else if (ch == 27 || ch == 'q' || ch == 'Q') {
-                map_picker_open = false;
-                snprintf(status, sizeof(status), "Map pick cancelled");
-            } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-                if (map_picker_count > 0) {
-                    const char *picked =
-                        map_picker_entries[map_picker_sel].name;
-                    if (send_map_select(sock_fd, picked) != 0) {
-                        snprintf(status, sizeof(status),
-                                 "MAP_SELECT failed: %s", strerror(errno));
-                    } else {
-                        snprintf(status, sizeof(status),
-                                 "Picked: %s", picked);
+            int ch = getch();
+            if (map_picker_open) {
+                if (ch == KEY_UP) {
+                    if (map_picker_sel > 0) {
+                        map_picker_sel--;
                     }
+                } else if (ch == KEY_DOWN) {
+                    if (map_picker_sel + 1 < map_picker_count) {
+                        map_picker_sel++;
+                    }
+                } else if (ch == 27 || ch == 'q' || ch == 'Q') {
+                    map_picker_open = false;
+                    snprintf(status, sizeof(status), "Map pick cancelled");
+                } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                    if (map_picker_count > 0) {
+                        const char *picked = map_picker_entries[map_picker_sel].name;
+                        if (send_map_select(sock_fd, picked) != 0) {
+                            snprintf(status, sizeof(status), "MAP_SELECT failed: %s", strerror(errno));
+                        } else {
+                            snprintf(status, sizeof(status), "Picked: %s", picked);
+                        }
+                    }
+                    map_picker_open = false;
                 }
-                map_picker_open = false;
+                continue;
             }
-            continue;
-        }
-        if (ch == 'q' || ch == 'Q') {
-            cleanup(0);
-        } else if ((ch == 'l' || ch == 'L') && game_state == GAME_LOBBY) {
-            if (!welcome_received) {
-                snprintf(status, sizeof(status),
-                         "Wait for server WELCOME before sending requests");
-            } else if (!i_am_leader()) {
-                snprintf(status, sizeof(status),
-                         "Only the leader (lowest ID) picks the map");
-            } else if (map_list_pending) {
-                snprintf(status, sizeof(status),
-                         "Map list already requested...");
-            } else if (send_map_list_request(sock_fd) == 0) {
-                map_list_pending = true;
-                snprintf(status, sizeof(status), "Requesting map list...");
-            } else {
-                snprintf(status, sizeof(status),
-                         "MAP_LIST_REQUEST failed: %s", strerror(errno));
-                if (errno == EPIPE || errno == ECONNRESET ||
-                    errno == EBADF  || errno == ENOTCONN) {
-                    disconnected = true;
-                }
-            }
-        } else if (ch == 'm' || ch == 'M') {
-            if (level_cfg_loaded) {
-                preview_level();
-            } else {
-                snprintf(status, sizeof(status), "No map loaded yet");
-            }
-        } else if (ch == ' ' && game_state == GAME_END) {
-            if (send_set_status(sock_fd, GAME_LOBBY) != 0) {
-                snprintf(status, sizeof(status),
-                         "Return-to-lobby failed: %s", strerror(errno));
-                if (errno == EPIPE || errno == ECONNRESET ||
-                    errno == EBADF  || errno == ENOTCONN) {
-                    disconnected = true;
-                }
-            } else {
-                snprintf(status, sizeof(status), "Returning to lobby...");
-            }
-        } else if (ch == ' ' && game_state == GAME_LOBBY) {
-            if (!welcome_received) {
-                snprintf(status, sizeof(status),
-                         "Wait for server WELCOME before sending requests");
-            } else if (me_ready) {
-                if (send_set_not_ready(sock_fd) == 0) {
-                    me_ready = false;
-                    snprintf(status, sizeof(status), "Unready");
+            if (ch == 'q' || ch == 'Q') {
+                cleanup(0);
+            } else if ((ch == 'l' || ch == 'L') && game_state == GAME_LOBBY) {
+                if (!welcome_received) {
+                    snprintf(status, sizeof(status), "Wait for server WELCOME before sending requests");
+                } else if (!i_am_leader()) {
+                    snprintf(status, sizeof(status), "Only the leader (lowest ID) picks the map");
+                } else if (map_list_pending) {
+                    snprintf(status, sizeof(status), "Map list already requested...");
+                } else if (send_map_list_request(sock_fd) == 0) {
+                    map_list_pending = true;
+                    snprintf(status, sizeof(status), "Requesting map list...");
                 } else {
-                    snprintf(status, sizeof(status),
-                             "SET_NOT_READY failed: %s", strerror(errno));
-                    if (errno == EPIPE || errno == ECONNRESET ||
-                        errno == EBADF  || errno == ENOTCONN) {
+                    snprintf(status, sizeof(status), "MAP_LIST_REQUEST failed: %s", strerror(errno));
+                    if (errno == EPIPE || errno == ECONNRESET || errno == EBADF || errno == ENOTCONN) {
                         disconnected = true;
                     }
                 }
-            } else if (send_set_ready(sock_fd) == 0) {
-                me_ready = true;
-                snprintf(status, sizeof(status),
-                         "Ready - waiting for others");
-            } else {
-                snprintf(status, sizeof(status),
-                         "SET_READY failed: %s", strerror(errno));
-                if (errno == EPIPE || errno == ECONNRESET ||
-                    errno == EBADF  || errno == ENOTCONN) {
-                    disconnected = true;
+            } else if (ch == 'm' || ch == 'M') {
+                if (level_cfg_loaded) {
+                    preview_level();
+                } else {
+                    snprintf(status, sizeof(status), "No map loaded yet");
+                }
+            } else if (ch == ' ' && game_state == GAME_END) {
+                if (send_set_status(sock_fd, GAME_LOBBY) != 0) {
+                    snprintf(status, sizeof(status), "Return-to-lobby failed: %s", strerror(errno));
+                    if (errno == EPIPE || errno == ECONNRESET || errno == EBADF || errno == ENOTCONN) {
+                        disconnected = true;
+                    }
+                } else {
+                    snprintf(status, sizeof(status), "Returning to lobby...");
+                }
+            } else if (ch == ' ' && game_state == GAME_LOBBY) {
+                if (!welcome_received) {
+                    snprintf(status, sizeof(status), "Wait for server WELCOME before sending requests");
+                } else if (me_ready) {
+                    if (send_set_not_ready(sock_fd) == 0) {
+                        me_ready = false;
+                        snprintf(status, sizeof(status), "Unready");
+                    } else {
+                        snprintf(status, sizeof(status), "SET_NOT_READY failed: %s", strerror(errno));
+                        if (errno == EPIPE || errno == ECONNRESET || errno == EBADF || errno == ENOTCONN) {
+                            disconnected = true;
+                        }
+                    }
+                } else if (send_set_ready(sock_fd) == 0) {
+                    me_ready = true;
+                    snprintf(status, sizeof(status), "Ready - waiting for others");
+                } else {
+                    snprintf(status, sizeof(status), "SET_READY failed: %s", strerror(errno));
+                    if (errno == EPIPE || errno == ECONNRESET || errno == EBADF || errno == ENOTCONN) {
+                        disconnected = true;
+                    }
+                }
+            } else if (game_state == GAME_RUNNING) {
+                char dir = 0;
+                if (ch == KEY_UP || ch == 'w' || ch == 'W') {
+                    dir = DIR_UP;
+                } else if (ch == KEY_DOWN || ch == 's' || ch == 'S') {
+                    dir = DIR_DOWN;
+                } else if (ch == KEY_LEFT || ch == 'a' || ch == 'A') {
+                    dir = DIR_LEFT;
+                } else if (ch == KEY_RIGHT || ch == 'd' || ch == 'D') {
+                    dir = DIR_RIGHT;
+                }
+                if (dir != 0) {
+                    if (send_move_attempt(sock_fd, dir) != 0) {
+                        snprintf(status, sizeof(status), "MOVE failed: %s", strerror(errno));
+                        if (errno == EPIPE || errno == ECONNRESET || errno == EBADF || errno == ENOTCONN) {
+                            disconnected = true;
+                        }
+                    }
+                } else if (ch == ' ' && my_player_id != ID_UNKNOWN && my_player_id >= 1 && my_player_id <= MAX_PLAYERS && level_cfg_loaded) {
+                    uint16_t cell = make_cell_index(players[my_player_id].row, players[my_player_id].col, level_cfg.cols);
+                    if (send_bomb_attempt(sock_fd, cell) != 0) {
+                        snprintf(status, sizeof(status), "BOMB failed: %s", strerror(errno));
+                        if (errno == EPIPE || errno == ECONNRESET || errno == EBADF || errno == ENOTCONN) {
+                            disconnected = true;
+                        }
+                    }
                 }
             }
-        } else if (game_state == GAME_RUNNING) {
-            char dir = 0;
-            if      (ch == KEY_UP    || ch == 'w' || ch == 'W') dir = DIR_UP;
-            else if (ch == KEY_DOWN  || ch == 's' || ch == 'S') dir = DIR_DOWN;
-            else if (ch == KEY_LEFT  || ch == 'a' || ch == 'A') dir = DIR_LEFT;
-            else if (ch == KEY_RIGHT || ch == 'd' || ch == 'D') dir = DIR_RIGHT;
-            if (dir != 0) {
-                if (send_move_attempt(sock_fd, dir) != 0) {
-                    snprintf(status, sizeof(status),
-                             "MOVE failed: %s", strerror(errno));
-                    if (errno == EPIPE || errno == ECONNRESET ||
-                        errno == EBADF  || errno == ENOTCONN) {
-                        disconnected = true;
-                    }
-                }
-            } else if (ch == ' ' && my_player_id != ID_UNKNOWN &&
-                       my_player_id >= 1 && my_player_id <= MAX_PLAYERS &&
-                       level_cfg_loaded) {
-                uint16_t cell = make_cell_index(
-                    players[my_player_id].row,
-                    players[my_player_id].col,
-                    level_cfg.cols);
-                if (send_bomb_attempt(sock_fd, cell) != 0) {
-                    snprintf(status, sizeof(status),
-                             "BOMB failed: %s", strerror(errno));
-                    if (errno == EPIPE || errno == ECONNRESET ||
-                        errno == EBADF  || errno == ENOTCONN) {
-                        disconnected = true;
-                    }
-                }
-            }
+
+            usleep(20000);
         }
 
-        usleep(20000);
-    }
-
-    if (sock_fd != -1) {
-        send_leave(sock_fd);
-        close(sock_fd);
-        sock_fd = -1;
-    }
-    snprintf(menu_status, sizeof(menu_status),
-             "Disconnected: %s", status);
-    menu_status_pair = PAIR_STATUS;
-    sel = 0;
-    reset_session_state();
+        if (sock_fd != -1) {
+            send_leave(sock_fd);
+            close(sock_fd);
+            sock_fd = -1;
+        }
+        snprintf(menu_status, sizeof(menu_status), "Disconnected: %s", status);
+        menu_status_pair = PAIR_STATUS;
+        sel = 0;
+        reset_session_state();
     }
 
     cleanup(0);
