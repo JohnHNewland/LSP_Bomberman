@@ -109,7 +109,6 @@ static int send_error(int fd, uint8_t target_id, const char *err) {
 static int  send_map_to(int fd, uint8_t target_id);
 static void broadcast_map(void);
 static void place_players_at_starts(void);
-static void place_one_player_at_start(int client_idx);
 static uint8_t pick_free_player_id(void);
 static void check_game_end(void);
 static void check_match_start(void);
@@ -1007,14 +1006,6 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
 
             if (send_welcome(client_fd, pid) == 0) {
                 log_msg("P%u <- WELCOME", pid);
-            }
-
-            if (level_cfg_loaded) {
-                place_one_player_at_start(client_idx);
-                if (send_map_to(client_fd, pid) == 0) {
-                    log_msg("P%u <- MAP (%ux%u)", pid,
-                            level_cfg.rows, level_cfg.cols);
-                }
             }
             
             // syncs when a player joins mid-game
