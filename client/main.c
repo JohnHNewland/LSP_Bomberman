@@ -14,20 +14,15 @@
 #include <sys/select.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <netdb.h>
 #include <time.h>
 #include <ncurses.h>
 
-#define WELCOME_TIMEOUT_SEC   30
-/* Per protokols.docx: send PING after IDLE_BEFORE_PING_SEC of silence,
- * and only consider the peer timed out if no PONG (or any other reply)
- * arrives within PONG_TIMEOUT_SEC of that PING. Silence alone is not a
- * timeout — that was the old bug that dropped idle lobby clients. */
-#define IDLE_BEFORE_PING_SEC  15
-#define PONG_TIMEOUT_SEC      30
-
 #include "../common/level_config.h"
 #include "../common/protocol.h"
+
+#define WELCOME_TIMEOUT_SEC   30
 
 #define DEFAULT_HOST "127.0.0.1"
 #define DEFAULT_PORT 7890
@@ -87,9 +82,51 @@ typedef struct {
     uint16_t bomb_timer_ticks;
     uint16_t speed;
     uint8_t  lives;
+    char     name[PLAYER_NAME_LEN + 1];
 } client_player_t;
 
 static client_player_t players[MAX_PLAYERS + 1] = {0};
+
+/* Notification feed: fixed ring buffer of recent in-match events. Drawn in
+ * the left UI column during the match so players can see who picked up
+ * what bonus and who just killed whom. Reset between matches so old kill
+ * messages don't bleed into the next round. */
+#define NOTIF_MAX      6
+#define NOTIF_LINE_LEN 80
+static char notif_buf[NOTIF_MAX][NOTIF_LINE_LEN];
+static int  notif_count = 0;
+
+/* Map-picker state. Populated when the leader requests the server's map
+ * list (MSG_MAP_LIST_REQUEST → MSG_MAP_LIST). map_picker_open opens a
+ * modal dialog that captures input until a map is chosen or cancelled. */
+#define MAP_PICKER_MAX 64
+static char map_picker_names[MAP_PICKER_MAX][MAP_NAME_LEN];
+static int  map_picker_count = 0;
+static int  map_picker_sel   = 0;
+static bool map_picker_open  = false;
+static bool map_list_pending = false;
+
+static void notif_push(const char *fmt, ...) {
+    int slot = notif_count % NOTIF_MAX;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(notif_buf[slot], NOTIF_LINE_LEN, fmt, ap);
+    va_end(ap);
+    notif_count++;
+}
+
+static void notif_clear(void) {
+    memset(notif_buf, 0, sizeof(notif_buf));
+    notif_count = 0;
+}
+
+static const char *player_label(uint8_t id) {
+    if (id >= 1 && id <= MAX_PLAYERS && players[id].name[0])
+        return players[id].name;
+    static char fallback[16];
+    snprintf(fallback, sizeof(fallback), "P%u", id);
+    return fallback;
+}
 
 static void reset_session_state(void) {
     me_ready = false;
@@ -99,6 +136,9 @@ static void reset_session_state(void) {
     match_winner_observed = false;
     level_config_free(&level_cfg);
     memset(players, 0, sizeof(players));
+    map_picker_open  = false;
+    map_picker_count = 0;
+    map_list_pending = false;
 }
 
 static const char *BANNER[] = {
@@ -285,6 +325,33 @@ static int send_bomb_attempt(int fd, uint16_t cell) {
     m.hdr.target_id = ID_SERVER;
     m.cell          = htons(cell);
     return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
+static int send_map_list_request(int fd) {
+    msg_generic_t m = { MSG_MAP_LIST_REQUEST, my_player_id, ID_SERVER };
+    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
+static int send_map_select(int fd, uint8_t index) {
+    msg_map_select_t m = {0};
+    m.hdr.msg_type  = MSG_MAP_SELECT;
+    m.hdr.sender_id = my_player_id;
+    m.hdr.target_id = ID_SERVER;
+    m.index = index;
+    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
+static uint8_t leader_id(void) {
+    uint8_t lead = 0;
+    for (int i = 1; i <= MAX_PLAYERS; i++) {
+        if (players[i].active && (lead == 0 || (uint8_t)i < lead))
+            lead = (uint8_t)i;
+    }
+    return lead;
+}
+
+static bool i_am_leader(void) {
+    return my_player_id != ID_UNKNOWN && my_player_id == leader_id();
 }
 
 /* Returns: >0 = bytes read, 0 = peer closed, -1 = nothing ready (errno=EAGAIN)
@@ -529,6 +596,54 @@ static void draw_cell(int y, int x, const cell_t *cell, int r, int c) {
     mvaddstr(y,     x, top);
     mvaddstr(y + 1, x, bot);
     attroff(COLOR_PAIR(pair) | attr);
+}
+
+static void draw_map_picker(void) {
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    int n = map_picker_count;
+    int box_w = 60;
+    int box_h = n + 6;
+    if (box_h > rows - 2) box_h = rows - 2;
+    int by = (rows - box_h) / 2;
+    int bx = (cols - box_w) / 2;
+    if (by < 1) by = 1;
+    if (bx < 1) bx = 1;
+
+    attron(COLOR_PAIR(PAIR_TITLE) | A_BOLD);
+    for (int i = 0; i < box_w; i++) {
+        mvaddch(by,             bx + i, '=');
+        mvaddch(by + box_h - 1, bx + i, '=');
+    }
+    for (int i = 1; i < box_h - 1; i++) {
+        mvaddch(by + i, bx,             '|');
+        mvaddch(by + i, bx + box_w - 1, '|');
+    }
+    mvaddstr(by + 1, bx + 2, "Pick a map (server's maps/)");
+    attroff(COLOR_PAIR(PAIR_TITLE) | A_BOLD);
+
+    int max_show = box_h - 5;
+    int first = 0;
+    if (map_picker_sel >= max_show) first = map_picker_sel - max_show + 1;
+    int last = first + max_show;
+    if (last > n) last = n;
+    attron(COLOR_PAIR(PAIR_NORMAL));
+    for (int i = first; i < last; i++) {
+        int row = by + 3 + (i - first);
+        if (i == map_picker_sel)
+            attron(A_REVERSE | A_BOLD);
+        mvprintw(row, bx + 2, " %c %-*s ",
+                 (i == map_picker_sel) ? '>' : ' ',
+                 box_w - 8, map_picker_names[i]);
+        if (i == map_picker_sel)
+            attroff(A_REVERSE | A_BOLD);
+    }
+    attroff(COLOR_PAIR(PAIR_NORMAL));
+
+    attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
+    mvaddstr(by + box_h - 2, bx + 2,
+             "[Up/Down] Move  [Enter] Pick  [Esc/q] Cancel");
+    attroff(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
 }
 
 static void draw_legend(int y, int x) {
@@ -891,6 +1006,22 @@ static void draw_ui(const char *host, int port, const char *player_name,
         attroff(COLOR_PAIR(PAIR_INFO));
     }
 
+    if ((game_state == GAME_RUNNING || game_state == GAME_END) &&
+        notif_count > 0 && y + 1 < rows - 1) {
+        y++;
+        attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
+        mvaddstr(y++, x, "Events");
+        attroff(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
+        attron(COLOR_PAIR(PAIR_NORMAL));
+        int show = notif_count < NOTIF_MAX ? notif_count : NOTIF_MAX;
+        int oldest = notif_count - show;
+        for (int i = 0; i < show && y < rows - 2; i++) {
+            int slot = (oldest + i) % NOTIF_MAX;
+            mvprintw(y++, x, "- %s", notif_buf[slot]);
+        }
+        attroff(COLOR_PAIR(PAIR_NORMAL));
+    }
+
     if (game_state == GAME_RUNNING && level_cfg_loaded) {
         int map_x = 38;
         int map_y = 3;
@@ -924,17 +1055,44 @@ static void draw_ui(const char *host, int port, const char *player_name,
         for (int r = 0; r < dr; r++) {
             for (int c = 0; c < dc; c++) {
                 cell_t cell = *level_cell_at(&level_cfg, r, c);
-                for (int pi = 1; pi <= MAX_PLAYERS; pi++) {
-                    if (players[pi].active && players[pi].alive &&
-                        players[pi].row == r && players[pi].col == c) {
-                        cell.type = CELL_PLAYER_START;
-                        cell.player_id = (uint8_t)pi;
-                        break;
+                /* Local player wins overlap rendering so the user
+                 * never loses sight of their own avatar when sharing
+                 * a cell with another player. */
+                uint8_t shown = 0;
+                if (my_player_id >= 1 && my_player_id <= MAX_PLAYERS &&
+                    players[my_player_id].active &&
+                    players[my_player_id].alive &&
+                    players[my_player_id].row == r &&
+                    players[my_player_id].col == c) {
+                    shown = my_player_id;
+                } else {
+                    for (int pi = 1; pi <= MAX_PLAYERS; pi++) {
+                        if (players[pi].active && players[pi].alive &&
+                            players[pi].row == r && players[pi].col == c) {
+                            shown = (uint8_t)pi;
+                            break;
+                        }
                     }
+                }
+                if (shown) {
+                    cell.type = CELL_PLAYER_START;
+                    cell.player_id = shown;
                 }
                 draw_cell(map_y + r * CELL_H,
                           map_x + c * CELL_W, &cell, r, c);
             }
+        }
+
+        /* Legend sits to the right of the board so players can read the
+         * symbol-to-meaning mapping during a live match. Suppressed when
+         * the terminal is too narrow or short to fit it without overlap. */
+        const int LEGEND_W = 24;
+        const int LEGEND_H = 21;
+        int legend_x = map_x + frame_w + 3;
+        int legend_y = map_y;
+        if (legend_x + LEGEND_W <= cols - 2 &&
+            legend_y + LEGEND_H <= rows - 1) {
+            draw_legend(legend_y, legend_x);
         }
     }
 
@@ -955,12 +1113,20 @@ static void draw_ui(const char *host, int port, const char *player_name,
             mvaddch(by + i, bx + bw - 1, '|');
         }
         char line1[] = "G A M E   O V E R";
-        char line2[64];
+        char line2[96];
+        const char *winner_name =
+            (last_winner_id >= 1 && last_winner_id <= MAX_PLAYERS &&
+             players[last_winner_id].name[0])
+                ? players[last_winner_id].name : NULL;
         if (last_winner_id == ID_UNKNOWN) {
             snprintf(line2, sizeof(line2), "Draw - no survivors");
         } else if (last_winner_id == my_player_id) {
             snprintf(line2, sizeof(line2),
-                     "You won! (id=%u)", last_winner_id);
+                     "You won! (%s)",
+                     winner_name ? winner_name : "");
+        } else if (winner_name) {
+            snprintf(line2, sizeof(line2),
+                     "%s wins", winner_name);
         } else {
             snprintf(line2, sizeof(line2),
                      "Player %u wins", last_winner_id);
@@ -978,9 +1144,16 @@ static void draw_ui(const char *host, int port, const char *player_name,
     } else if (game_state == GAME_END) {
         draw_status_bar(" [SPACE] New match (back to lobby)   [q] Quit",
                         status, PAIR_STATUS);
+    } else if (i_am_leader()) {
+        draw_status_bar(" [L] Choose map   [m] Map   [SPACE] Start   [q] Quit",
+                        status, PAIR_STATUS);
     } else {
         draw_status_bar(" [p] PING   [m] Map   [SPACE] Start   [q] Quit",
                         status, PAIR_STATUS);
+    }
+
+    if (map_picker_open) {
+        draw_map_picker();
     }
     refresh();
 }
@@ -1144,6 +1317,9 @@ int main(int argc, char *argv[]) {
                             my_player_id <= MAX_PLAYERS) {
                             players[my_player_id].active = true;
                             players[my_player_id].alive  = true;
+                            snprintf(players[my_player_id].name,
+                                     sizeof(players[my_player_id].name),
+                                     "%s", player_name);
                         }
                         const msg_other_client_t *oc =
                             (const msg_other_client_t *)(buf + off
@@ -1153,6 +1329,9 @@ int main(int argc, char *argv[]) {
                             if (id >= 1 && id <= MAX_PLAYERS) {
                                 players[id].active = true;
                                 players[id].alive  = true;
+                                memcpy(players[id].name, oc[k].name,
+                                       PLAYER_NAME_LEN);
+                                players[id].name[PLAYER_NAME_LEN] = '\0';
                             }
                         }
                         welcome_received = true;
@@ -1161,6 +1340,8 @@ int main(int argc, char *argv[]) {
                     }
                     case MSG_HELLO: {
                         if (avail < sizeof(msg_hello_t)) goto stop;
+                        const msg_hello_t *h =
+                            (const msg_hello_t *)(buf + off);
                         uint8_t id = hdr->sender_id;
                         if (id >= 1 && id <= MAX_PLAYERS) {
                             /* HELLO may be for a freshly reused ID — wipe
@@ -1170,6 +1351,9 @@ int main(int argc, char *argv[]) {
                             memset(&players[id], 0, sizeof(players[id]));
                             players[id].active = true;
                             players[id].alive  = true;
+                            memcpy(players[id].name, h->player_name,
+                                   PLAYER_NAME_LEN);
+                            players[id].name[PLAYER_NAME_LEN] = '\0';
                         }
                         consumed = sizeof(msg_hello_t);
                         break;
@@ -1182,6 +1366,7 @@ int main(int argc, char *argv[]) {
                         if (game_state == GAME_RUNNING) {
                             last_winner_id = ID_UNKNOWN;
                             match_winner_observed = false;
+                            notif_clear();
                             for (int k = 1; k <= MAX_PLAYERS; k++) {
                                 if (players[k].active)
                                     players[k].alive = true;
@@ -1192,6 +1377,7 @@ int main(int argc, char *argv[]) {
                             me_ready = false;
                             last_winner_id = ID_UNKNOWN;
                             match_winner_observed = false;
+                            notif_clear();
                             for (int k = 1; k <= MAX_PLAYERS; k++) {
                                 if (players[k].active)
                                     players[k].alive = true;
@@ -1320,12 +1506,12 @@ int main(int argc, char *argv[]) {
                         if (level_cfg_loaded && level_cfg.cols > 0 &&
                             mv->player_id >= 1 &&
                             mv->player_id <= MAX_PLAYERS) {
+                            uint16_t r, c;
+                            split_cell_index(coord, level_cfg.cols, &r, &c);
                             players[mv->player_id].active = true;
                             players[mv->player_id].alive  = true;
-                            players[mv->player_id].row =
-                                coord / level_cfg.cols;
-                            players[mv->player_id].col =
-                                coord % level_cfg.cols;
+                            players[mv->player_id].row    = r;
+                            players[mv->player_id].col    = c;
                         }
                         consumed = sizeof(msg_moved_t);
                         break;
@@ -1342,6 +1528,18 @@ int main(int argc, char *argv[]) {
                             snprintf(status, sizeof(status),
                                      "You died!");
                         }
+                        /* sender_id carries the killer (bomb owner). When
+                         * server can't attribute the kill it falls back to
+                         * the victim's own id. */
+                        uint8_t killer = hdr->sender_id;
+                        if (killer == d->player_id || killer == ID_SERVER) {
+                            notif_push("%s died",
+                                       player_label(d->player_id));
+                        } else {
+                            notif_push("%s killed %s",
+                                       player_label(killer),
+                                       player_label(d->player_id));
+                        }
                         consumed = sizeof(msg_death_t);
                         break;
                     }
@@ -1351,12 +1549,20 @@ int main(int argc, char *argv[]) {
                             (const msg_winner_t *)(buf + off);
                         last_winner_id = w->winner_id;
                         match_winner_observed = true;
+                        const char *wname =
+                            (w->winner_id >= 1 &&
+                             w->winner_id <= MAX_PLAYERS &&
+                             players[w->winner_id].name[0])
+                                ? players[w->winner_id].name : NULL;
                         if (w->winner_id == ID_UNKNOWN) {
                             snprintf(status, sizeof(status),
                                      "Draw - no survivors");
                         } else if (w->winner_id == my_player_id) {
                             snprintf(status, sizeof(status),
                                      "You won!");
+                        } else if (wname) {
+                            snprintf(status, sizeof(status),
+                                     "%s won", wname);
                         } else {
                             snprintf(status, sizeof(status),
                                      "Player %u won", w->winner_id);
@@ -1370,8 +1576,8 @@ int main(int argc, char *argv[]) {
                             (const msg_bomb_t *)(buf + off);
                         uint16_t coord = ntohs(b->cell);
                         if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t r = coord / level_cfg.cols;
-                            uint16_t c = coord % level_cfg.cols;
+                            uint16_t r, c;
+                            split_cell_index(coord, level_cfg.cols, &r, &c);
                             if (r < level_cfg.rows && c < level_cfg.cols) {
                                 cell_t *cl =
                                     level_cell_at(&level_cfg, r, c);
@@ -1388,18 +1594,22 @@ int main(int argc, char *argv[]) {
                             (const msg_explosion_t *)(buf + off);
                         uint16_t coord = ntohs(e->cell);
                         if (level_cfg_loaded && level_cfg.cols > 0) {
-                            int br = coord / level_cfg.cols;
-                            int bc = coord % level_cfg.cols;
+                            uint16_t br16, bc16;
+                            split_cell_index(coord, level_cfg.cols,
+                                             &br16, &bc16);
+                            int br = (int)br16, bc = (int)bc16;
                             cell_t *cell0 =
                                 level_cell_at(&level_cfg, br, bc);
                             cell0->type = CELL_EXPLOSION;
-                            static const int drs[] = {-1,1,0,0};
-                            static const int dcs[] = {0,0,-1,1};
+                            static const uint8_t dirs[] = {
+                                DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
                             for (int d = 0; d < 4; d++) {
+                                int dr, dc;
+                                dir_delta(dirs[d], &dr, &dc);
                                 for (int dist = 1;
                                      dist <= e->radius; dist++) {
-                                    int rr = br + drs[d] * dist;
-                                    int cc = bc + dcs[d] * dist;
+                                    int rr = br + dr * dist;
+                                    int cc = bc + dc * dist;
                                     if (rr < 0 || rr >= level_cfg.rows ||
                                         cc < 0 || cc >= level_cfg.cols)
                                         break;
@@ -1422,19 +1632,23 @@ int main(int argc, char *argv[]) {
                             (const msg_explosion_t *)(buf + off);
                         uint16_t coord = ntohs(e->cell);
                         if (level_cfg_loaded && level_cfg.cols > 0) {
-                            int br = coord / level_cfg.cols;
-                            int bc = coord % level_cfg.cols;
+                            uint16_t br16, bc16;
+                            split_cell_index(coord, level_cfg.cols,
+                                             &br16, &bc16);
+                            int br = (int)br16, bc = (int)bc16;
                             cell_t *cell0 =
                                 level_cell_at(&level_cfg, br, bc);
                             if (cell0->type == CELL_EXPLOSION)
                                 cell0->type = CELL_EMPTY;
-                            static const int drs[] = {-1,1,0,0};
-                            static const int dcs[] = {0,0,-1,1};
+                            static const uint8_t dirs[] = {
+                                DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
                             for (int d = 0; d < 4; d++) {
+                                int dr, dc;
+                                dir_delta(dirs[d], &dr, &dc);
                                 for (int dist = 1;
                                      dist <= e->radius; dist++) {
-                                    int rr = br + drs[d] * dist;
-                                    int cc = bc + dcs[d] * dist;
+                                    int rr = br + dr * dist;
+                                    int cc = bc + dc * dist;
                                     if (rr < 0 || rr >= level_cfg.rows ||
                                         cc < 0 || cc >= level_cfg.cols)
                                         break;
@@ -1455,8 +1669,8 @@ int main(int argc, char *argv[]) {
                             (const msg_block_destroyed_t *)(buf + off);
                         uint16_t coord = ntohs(bd->cell);
                         if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t r = coord / level_cfg.cols;
-                            uint16_t c = coord % level_cfg.cols;
+                            uint16_t r, c;
+                            split_cell_index(coord, level_cfg.cols, &r, &c);
                             if (r < level_cfg.rows && c < level_cfg.cols) {
                                 cell_t *cl =
                                     level_cell_at(&level_cfg, r, c);
@@ -1475,8 +1689,8 @@ int main(int argc, char *argv[]) {
                             (const msg_bonus_available_t *)(buf + off);
                         uint16_t coord = ntohs(bn->cell);
                         if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t r = coord / level_cfg.cols;
-                            uint16_t c = coord % level_cfg.cols;
+                            uint16_t r, c;
+                            split_cell_index(coord, level_cfg.cols, &r, &c);
                             if (r < level_cfg.rows && c < level_cfg.cols) {
                                 cell_t *cl =
                                     level_cell_at(&level_cfg, r, c);
@@ -1494,6 +1708,34 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         consumed = sizeof(msg_bonus_available_t);
+                        break;
+                    }
+                    case MSG_MAP_LIST: {
+                        if (avail < sizeof(msg_map_list_t)) goto stop;
+                        const msg_map_list_t *ml =
+                            (const msg_map_list_t *)(buf + off);
+                        size_t total = sizeof(msg_map_list_t) +
+                            (size_t)ml->count * MAP_NAME_LEN;
+                        if (avail < total) goto stop;
+                        int n = ml->count;
+                        if (n > MAP_PICKER_MAX) n = MAP_PICKER_MAX;
+                        const char *src = (const char *)(buf + off
+                                                + sizeof(msg_map_list_t));
+                        for (int i = 0; i < n; i++) {
+                            memcpy(map_picker_names[i],
+                                   src + i * MAP_NAME_LEN,
+                                   MAP_NAME_LEN);
+                            map_picker_names[i][MAP_NAME_LEN - 1] = '\0';
+                        }
+                        map_picker_count = n;
+                        map_picker_sel   = 0;
+                        map_picker_open  = (n > 0);
+                        map_list_pending = false;
+                        if (n == 0) {
+                            snprintf(status, sizeof(status),
+                                     "Server has no maps");
+                        }
+                        consumed = total;
                         break;
                     }
                     case MSG_SYNC_BOARD: {
@@ -1521,11 +1763,28 @@ int main(int argc, char *argv[]) {
                             (const msg_bonus_retrieved_t *)(buf + off);
                         uint16_t coord = ntohs(br->cell);
                         if (level_cfg_loaded && level_cfg.cols > 0) {
-                            uint16_t r = coord / level_cfg.cols;
-                            uint16_t c = coord % level_cfg.cols;
+                            uint16_t r, c;
+                            split_cell_index(coord, level_cfg.cols, &r, &c);
                             if (r < level_cfg.rows && c < level_cfg.cols) {
                                 cell_t *cl =
                                     level_cell_at(&level_cfg, r, c);
+                                const char *bname = NULL;
+                                switch (cl->type) {
+                                    case CELL_BONUS_SPEED:
+                                        bname = "Speed +1";  break;
+                                    case CELL_BONUS_RADIUS:
+                                        bname = "Radius +1"; break;
+                                    case CELL_BONUS_TIMER:
+                                        bname = "Timer +10t";break;
+                                    case CELL_BONUS_BOMBS:
+                                        bname = "Bombs +1";  break;
+                                    default: break;
+                                }
+                                if (bname) {
+                                    notif_push("%s picked up %s",
+                                               player_label(br->player_id),
+                                               bname);
+                                }
                                 cl->type = CELL_EMPTY;
                                 cl->player_id = 0;
                             }
@@ -1576,8 +1835,50 @@ int main(int argc, char *argv[]) {
         draw_ui(host, port, player_name, status);
 
         int ch = getch();
+        if (map_picker_open) {
+            if (ch == KEY_UP) {
+                if (map_picker_sel > 0) map_picker_sel--;
+            } else if (ch == KEY_DOWN) {
+                if (map_picker_sel + 1 < map_picker_count) map_picker_sel++;
+            } else if (ch == 27 || ch == 'q' || ch == 'Q') {
+                map_picker_open = false;
+                snprintf(status, sizeof(status), "Map pick cancelled");
+            } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                if (map_picker_count > 0) {
+                    if (send_map_select(sock_fd,
+                                        (uint8_t)map_picker_sel) != 0) {
+                        snprintf(status, sizeof(status),
+                                 "MAP_SELECT failed: %s", strerror(errno));
+                    } else {
+                        snprintf(status, sizeof(status),
+                                 "Picked: %s",
+                                 map_picker_names[map_picker_sel]);
+                    }
+                }
+                map_picker_open = false;
+            }
+            continue;
+        }
         if (ch == 'q' || ch == 'Q') {
             cleanup(0);
+        } else if ((ch == 'l' || ch == 'L') && game_state == GAME_LOBBY) {
+            if (!i_am_leader()) {
+                snprintf(status, sizeof(status),
+                         "Only the leader (lowest ID) picks the map");
+            } else if (map_list_pending) {
+                snprintf(status, sizeof(status),
+                         "Map list already requested...");
+            } else if (send_map_list_request(sock_fd) == 0) {
+                map_list_pending = true;
+                snprintf(status, sizeof(status), "Requesting map list...");
+            } else {
+                snprintf(status, sizeof(status),
+                         "MAP_LIST_REQUEST failed: %s", strerror(errno));
+                if (errno == EPIPE || errno == ECONNRESET ||
+                    errno == EBADF  || errno == ENOTCONN) {
+                    disconnected = true;
+                }
+            }
         } else if (ch == 'm' || ch == 'M') {
             if (level_cfg_loaded) {
                 preview_level();
@@ -1628,9 +1929,10 @@ int main(int argc, char *argv[]) {
             } else if (ch == ' ' && my_player_id != ID_UNKNOWN &&
                        my_player_id >= 1 && my_player_id <= MAX_PLAYERS &&
                        level_cfg_loaded) {
-                uint16_t cell = (uint16_t)(
-                    players[my_player_id].row * level_cfg.cols +
-                    players[my_player_id].col);
+                uint16_t cell = make_cell_index(
+                    players[my_player_id].row,
+                    players[my_player_id].col,
+                    level_cfg.cols);
                 if (send_bomb_attempt(sock_fd, cell) != 0) {
                     snprintf(status, sizeof(status),
                              "BOMB failed: %s", strerror(errno));

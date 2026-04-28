@@ -15,6 +15,9 @@
 #define MAX_PLAYERS       8
 #define TICKS_PER_SECOND  20
 
+#define IDLE_BEFORE_PING_SEC  15
+#define PONG_TIMEOUT_SEC      30
+
 typedef enum {
     GAME_LOBBY   = 0,
     GAME_RUNNING = 1,
@@ -66,7 +69,14 @@ typedef enum {
     MSG_BONUS_RETRIEVED  = 46,
     MSG_BLOCK_DESTROYED  = 47,
     MSG_SYNC_BOARD       = 100,
-    MSG_SYNC_REQUEST     = 101
+    MSG_SYNC_REQUEST     = 101,
+    /* Lobby-only, leader-only map picker. Not in protokols.docx (the spec
+     * mandates leader-driven map selection but leaves the wire format
+     * open). Uses IDs above the spec's range so it doesn't collide with
+     * future spec additions. */
+    MSG_MAP_LIST_REQUEST = 110,
+    MSG_MAP_LIST         = 111,
+    MSG_MAP_SELECT       = 112
 } msg_type_t;
 
 typedef struct {
@@ -176,6 +186,19 @@ typedef struct {
     uint16_t speed;
 } msg_sync_board_t;
 
+#define MAP_NAME_LEN 64
+
+typedef struct {
+    msg_generic_t hdr;
+    uint8_t       count;
+    /* Followed by count * char[MAP_NAME_LEN]. */
+} msg_map_list_t;
+
+typedef struct {
+    msg_generic_t hdr;
+    uint8_t       index;
+} msg_map_select_t;
+
 typedef struct {
     uint8_t  id;
     uint8_t  lives;
@@ -204,5 +227,6 @@ typedef struct {
 uint16_t make_cell_index(uint16_t row, uint16_t col, uint16_t cols);
 void     split_cell_index(uint16_t index, uint16_t cols,
                           uint16_t *row, uint16_t *col);
+bool     dir_delta(uint8_t dir, int *dr, int *dc);
 
 #endif

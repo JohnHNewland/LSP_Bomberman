@@ -1,14 +1,16 @@
-13 17 4 10 3 60
-H H H H H H H H H H H H H H H H H
-H 1 . . . . . . . . . . . . . 2 H
-H . H . H . H . H . H . H . H . H
-H S . S . . . S . S . S . . . S H
-H . H A H . H . H R H . H . H . H
-H . . . . S . . . . . . . S . . H
-H . H N H . H . H . H . H T H . H
-H . S . . . . . S . S . . . . S H
-H . H . H . H R H . H A H . H . H
-H . . S . . . . . . . . . S . . H
-H . H T H . H . H . H N H . H . H
-H 3 . . . . . . . . . . . . . 4 H
-H H H H H H H H H H H H H H H H H
+15 21 4 12 4 60
+H H H H H H H H H H H H H H H H H H H H H
+H 1 . . . . . . . . . . . . . . . . . 2 H
+H . H . H . H . H . H . H . H . H . H . H
+H S . S . S . S . S . S . S . S . S . S H
+H . H R H . H . H A H . H . H . H . H . H
+H . . . . S . S . . . S . S . . . S . . H
+H . H . H . H N H . H . H . H T H . H . H
+H S . . . . . S . . . . . S . . . . . S H
+H . H . H A H . H . H . H . H . H . H . H
+H S . . . . . S . . . . . S . . . . . S H
+H . H N H . H . H R H . H . H . H A H . H
+H . . . . S . S . . . S . S . . . S . . H
+H . H . H . H T H . H . H . H N H . H . H
+H 3 . . . . . . . . . . . . . . . . . 4 H
+H H H H H H H H H H H H H H H H H H H H H

@@ -42,9 +42,6 @@ typedef struct {
     time_t   pong_pending_since;
 } client_t;
 
-#define IDLE_BEFORE_PING_SEC 15
-#define PONG_TIMEOUT_SEC     30
-
 static int server_fd = -1;
 static client_t clients[MAX_CLIENTS];
 static int active_clients_count = 0;
@@ -78,6 +75,7 @@ typedef struct {
 
 typedef struct {
     bool     active;
+    uint8_t  owner_id;
     uint16_t row, col;
     uint8_t  radius;
     uint16_t end_in_ticks;
@@ -150,10 +148,11 @@ static int broadcast_bomb(uint8_t player_id, uint16_t cell) {
     return sent;
 }
 
-static int broadcast_explosion(uint8_t type, uint8_t radius, uint16_t cell) {
+static int broadcast_explosion(uint8_t type, uint8_t owner_id,
+                               uint8_t radius, uint16_t cell) {
     msg_explosion_t m = {0};
     m.hdr.msg_type  = type;
-    m.hdr.sender_id = ID_SERVER;
+    m.hdr.sender_id = owner_id;
     m.hdr.target_id = ID_BROADCAST;
     m.radius        = radius;
     m.cell          = htons(cell);
@@ -179,10 +178,14 @@ static int broadcast_block_destroyed(uint16_t cell) {
     return sent;
 }
 
-static int broadcast_death(uint8_t player_id) {
+static int broadcast_death(uint8_t killer_id, uint8_t player_id) {
     msg_death_t m = {0};
     m.hdr.msg_type  = MSG_DEATH;
-    m.hdr.sender_id = ID_SERVER;
+    /* sender_id carries the killer (bomb owner). When the death is from
+     * walking into a stale explosion whose origin we lost, killer_id is
+     * passed as the victim's own id, which the client renders as
+     * "self-inflicted / unknown killer". */
+    m.hdr.sender_id = killer_id;
     m.hdr.target_id = ID_BROADCAST;
     m.player_id     = player_id;
     int sent = 0;
@@ -280,24 +283,37 @@ static int find_bomb_at(uint16_t row, uint16_t col) {
     return -1;
 }
 
-static void kill_players_at(uint16_t row, uint16_t col) {
+static void kill_players_at(uint8_t killer_id, uint16_t row, uint16_t col) {
     for (int i = 0; i < active_clients_count; i++) {
         if (clients[i].fd == -1) continue;
         if (!clients[i].p.alive) continue;
         if (clients[i].p.row == row && clients[i].p.col == col) {
             clients[i].p.alive = false;
-            broadcast_death(clients[i].p.id);
-            log_msg("Player %u died at (%u,%u)",
-                    clients[i].p.id, row, col);
+            broadcast_death(killer_id, clients[i].p.id);
+            log_msg("Player %u died at (%u,%u) (killer=%u)",
+                    clients[i].p.id, row, col, killer_id);
         }
     }
 }
 
-static int add_explosion(uint16_t row, uint16_t col, uint8_t radius,
-                         uint16_t danger) {
+static int find_explosion_owner_at(uint16_t row, uint16_t col) {
+    for (int i = 0; i < MAX_EXPLOSIONS; i++) {
+        if (!explosions[i].active) continue;
+        if (explosions[i].row == row && explosions[i].col == col)
+            return explosions[i].owner_id;
+        /* Cells in the cross (not the center) are not stored individually,
+         * so a walk-into kill on a cross arm will not resolve here. The
+         * caller falls back to victim-as-killer in that case. */
+    }
+    return -1;
+}
+
+static int add_explosion(uint8_t owner_id, uint16_t row, uint16_t col,
+                         uint8_t radius, uint16_t danger) {
     for (int i = 0; i < MAX_EXPLOSIONS; i++) {
         if (!explosions[i].active) {
             explosions[i].active = true;
+            explosions[i].owner_id = owner_id;
             explosions[i].row = row;
             explosions[i].col = col;
             explosions[i].radius = radius;
@@ -314,23 +330,28 @@ static void detonate_bomb(int idx) {
     server_bomb_t b = bombs[idx];
     bombs[idx].active = false;
 
-    cell_t *cell = level_cell_at(&level_cfg, b.row, b.col);
-    if (cell->type == CELL_BOMB) cell->type = CELL_EMPTY;
-
     /* Send EXPLOSION_START before mutating the map so clients walk
      * the cross with the same cell state the server saw. */
-    uint16_t bomb_cell = (uint16_t)(b.row * level_cfg.cols + b.col);
-    broadcast_explosion(MSG_EXPLOSION_START, b.radius, bomb_cell);
+    uint16_t bomb_cell = make_cell_index(b.row, b.col, level_cfg.cols);
+    broadcast_explosion(MSG_EXPLOSION_START, b.owner_id, b.radius, bomb_cell);
     log_msg("Bomb detonated at (%u,%u) r=%u", b.row, b.col, b.radius);
 
-    kill_players_at(b.row, b.col);
+    /* Mark the bomb's own cell as a danger zone for the duration of the
+     * explosion so a player walking onto it (or already standing on it)
+     * dies — see MOVE_ATTEMPT's CELL_EXPLOSION check. */
+    cell_t *cell = level_cell_at(&level_cfg, b.row, b.col);
+    cell->type = CELL_EXPLOSION;
+    cell->player_id = 0;
 
-    static const int drs[] = {-1, 1, 0, 0};
-    static const int dcs[] = { 0, 0,-1, 1};
+    kill_players_at(b.owner_id, b.row, b.col);
+
+    static const uint8_t dirs[] = { DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
     for (int d = 0; d < 4; d++) {
+        int dr, dc;
+        dir_delta(dirs[d], &dr, &dc);
         for (int dist = 1; dist <= b.radius; dist++) {
-            int r = (int)b.row + drs[d] * dist;
-            int c = (int)b.col + dcs[d] * dist;
+            int r = (int)b.row + dr * dist;
+            int c = (int)b.col + dc * dist;
             if (r < 0 || r >= level_cfg.rows ||
                 c < 0 || c >= level_cfg.cols) break;
             cell_t *t = level_cell_at(&level_cfg, r, c);
@@ -339,28 +360,52 @@ static void detonate_bomb(int idx) {
             int chain = find_bomb_at((uint16_t)r, (uint16_t)c);
             if (chain >= 0) bombs[chain].timer_ticks = 1;
 
-            if (t->type == CELL_SOFT_BLOCK) {
-                t->type = CELL_EMPTY;
-                t->player_id = 0;
+            bool was_soft = (t->type == CELL_SOFT_BLOCK);
+            if (was_soft) {
                 broadcast_block_destroyed(
-                    (uint16_t)(r * level_cfg.cols + c));
-                break;  /* explosion stops at the soft block */
+                    make_cell_index((uint16_t)r, (uint16_t)c, level_cfg.cols));
             }
-            if (t->type == CELL_BONUS_SPEED ||
-                t->type == CELL_BONUS_RADIUS ||
-                t->type == CELL_BONUS_TIMER ||
-                t->type == CELL_BONUS_BOMBS) {
-                t->type = CELL_EMPTY;
-                t->player_id = 0;
-            }
-            kill_players_at((uint16_t)r, (uint16_t)c);
+            /* Overwrite the cell with the live explosion. Soft blocks,
+             * bonuses, and empty cells all become danger zones; bombs at
+             * the cell are handled via chain detonation above. */
+            t->type = CELL_EXPLOSION;
+            t->player_id = 0;
+            kill_players_at(b.owner_id, (uint16_t)r, (uint16_t)c);
+            if (was_soft) break;  /* explosion stops at the soft block */
         }
     }
 
     uint16_t danger = b.danger_ticks;
     if (danger == 0) danger = DEFAULT_DANGER_TICKS;
-    add_explosion(b.row, b.col, b.radius, danger);
+    add_explosion(b.owner_id, b.row, b.col, b.radius, danger);
     check_game_end();
+}
+
+/* Walks the same cross as detonate_bomb and clears any cell still tagged
+ * CELL_EXPLOSION back to CELL_EMPTY when the danger period ends. Stops at
+ * the first non-explosion cell (overlapping explosions may have already
+ * cleared it). */
+static void clear_explosion_cells(uint16_t row, uint16_t col, uint8_t radius) {
+    cell_t *center = level_cell_at(&level_cfg, row, col);
+    if (center->type == CELL_EXPLOSION) {
+        center->type = CELL_EMPTY;
+        center->player_id = 0;
+    }
+    static const uint8_t dirs[] = { DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
+    for (int d = 0; d < 4; d++) {
+        int dr, dc;
+        dir_delta(dirs[d], &dr, &dc);
+        for (int dist = 1; dist <= radius; dist++) {
+            int r = (int)row + dr * dist;
+            int c = (int)col + dc * dist;
+            if (r < 0 || r >= level_cfg.rows ||
+                c < 0 || c >= level_cfg.cols) break;
+            cell_t *t = level_cell_at(&level_cfg, r, c);
+            if (t->type != CELL_EXPLOSION) break;
+            t->type = CELL_EMPTY;
+            t->player_id = 0;
+        }
+    }
 }
 
 static void server_tick(void) {
@@ -374,9 +419,13 @@ static void server_tick(void) {
         if (!explosions[i].active) continue;
         if (explosions[i].end_in_ticks > 0) explosions[i].end_in_ticks--;
         if (explosions[i].end_in_ticks == 0) {
-            uint16_t cell = (uint16_t)(explosions[i].row * level_cfg.cols
-                                       + explosions[i].col);
+            uint16_t cell = make_cell_index(explosions[i].row,
+                                            explosions[i].col,
+                                            level_cfg.cols);
+            clear_explosion_cells(explosions[i].row, explosions[i].col,
+                                  explosions[i].radius);
             broadcast_explosion(MSG_EXPLOSION_END,
+                                explosions[i].owner_id,
                                 explosions[i].radius, cell);
             explosions[i].active = false;
         }
@@ -729,6 +778,53 @@ static void place_one_player_at_start(int client_idx) {
             id, clients[client_idx].p.row, clients[client_idx].p.col);
 }
 
+/* Load and activate the map at entries[idx]. Returns 0 on success and
+ * fills *out_name with the basename. On failure returns -1 and writes a
+ * short reason into err. Side-effects on success: replaces level_cfg,
+ * sets level_cfg_loaded, places players at start cells, broadcasts MAP,
+ * and checks whether the match is now ready to start. */
+static int activate_level_index(const level_entry_t *entries, int n, int idx,
+                                char *out_name, size_t out_name_len,
+                                char *err, size_t err_len) {
+    if (idx < 0 || idx >= n) {
+        if (err && err_len) snprintf(err, err_len, "bad index %d", idx);
+        return -1;
+    }
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", LEVEL_DIR, entries[idx].name);
+
+    level_config_t tmp = {0};
+    char load_err[64];
+    if (level_config_load(path, &tmp, load_err, sizeof(load_err)) != 0) {
+        if (err && err_len)
+            snprintf(err, err_len, "load failed: %s", load_err);
+        return -1;
+    }
+    int starts = count_player_starts(&tmp);
+    if (starts < active_clients_count) {
+        if (err && err_len)
+            snprintf(err, err_len, "map fits %d, %d connected",
+                     starts, active_clients_count);
+        level_config_free(&tmp);
+        return -1;
+    }
+    level_config_free(&level_cfg);
+    level_cfg = tmp;
+    level_cfg_loaded = true;
+    level_config_free(&level_cfg_pristine);
+    level_cfg_clone(&level_cfg_pristine, &level_cfg);
+    if (out_name && out_name_len)
+        snprintf(out_name, out_name_len, "%s", entries[idx].name);
+    log_msg("Level loaded: %s (%ux%u, max=%d, s=%u d=%u r=%u t=%u)",
+            entries[idx].name, level_cfg.rows, level_cfg.cols, starts,
+            level_cfg.speed, level_cfg.danger_ticks, level_cfg.radius,
+            level_cfg.bomb_timer_ticks);
+    place_players_at_starts();
+    broadcast_map();
+    check_match_start();
+    return 0;
+}
+
 static void load_level_dialog(void) {
     log_msg("Opening level picker...");
 
@@ -778,34 +874,25 @@ static void load_level_dialog(void) {
     }
     nodelay(stdscr, TRUE);
 
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s", LEVEL_DIR, entries[sel].name);
+    char err[96], name[LEVEL_NAME_MAX];
+    if (activate_level_index(entries, n, sel, name, sizeof(name),
+                             err, sizeof(err)) != 0) {
+        log_msg("Level load failed: %s", err);
+    }
+}
 
-    level_config_t tmp = {0};
-    char err[96];
-    if (level_config_load(path, &tmp, err, sizeof(err)) != 0) {
-        log_msg("Level load failed (%s): %s", path, err);
-        return;
+/* Lobby leader = player with the lowest active id. Empty room → 0. */
+static uint8_t lobby_leader_id(void) {
+    uint8_t lead = 0;
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd == -1) continue;
+        uint8_t id = clients[i].p.id;
+        if (id >= 1 && id <= LEVEL_MAX_PLAYERS &&
+            (lead == 0 || id < lead)) {
+            lead = id;
+        }
     }
-    int starts = count_player_starts(&tmp);
-    if (starts < active_clients_count) {
-        log_msg("Level only fits %d player(s) - %d connected. Cancelled.",
-                starts, active_clients_count);
-        level_config_free(&tmp);
-        return;
-    }
-    level_config_free(&level_cfg);
-    level_cfg = tmp;
-    level_cfg_loaded = true;
-    level_config_free(&level_cfg_pristine);
-    level_cfg_clone(&level_cfg_pristine, &level_cfg);
-    log_msg("Level loaded: %s (%ux%u, max=%d, s=%u d=%u r=%u t=%u)",
-            entries[sel].name, level_cfg.rows, level_cfg.cols, starts,
-            level_cfg.speed, level_cfg.danger_ticks, level_cfg.radius,
-            level_cfg.bomb_timer_ticks);
-    place_players_at_starts();
-    broadcast_map();
-    check_match_start();
+    return lead;
 }
 
 int init_ncurses() {
@@ -978,15 +1065,10 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             const msg_move_attempt_t *ma =
                 (const msg_move_attempt_t *)buffer;
             int dr = 0, dc = 0;
-            switch ((char)ma->direction) {
-                case DIR_UP:    dr = -1; break;
-                case DIR_DOWN:  dr =  1; break;
-                case DIR_LEFT:  dc = -1; break;
-                case DIR_RIGHT: dc =  1; break;
-                default:
-                    send_error(client_fd, clients[client_idx].p.id,
-                               "Bad direction");
-                    return 0;
+            if (!dir_delta(ma->direction, &dr, &dc)) {
+                send_error(client_fd, clients[client_idx].p.id,
+                           "Bad direction");
+                return 0;
             }
             int nr = (int)clients[client_idx].p.row + dr;
             int nc = (int)clients[client_idx].p.col + dc;
@@ -1003,25 +1085,26 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
                 send_error(client_fd, clients[client_idx].p.id, "Blocked");
                 return 0;
             }
-            for (int i = 0; i < active_clients_count; i++) {
-                if (i == client_idx) continue;
-                if (clients[i].fd == -1 || !clients[i].p.alive) continue;
-                if (clients[i].p.row == (uint16_t)nr &&
-                    clients[i].p.col == (uint16_t)nc) {
-                    send_error(client_fd, clients[client_idx].p.id,
-                               "Player there");
-                    return 0;
-                }
-            }
+            /* Player-on-player collision is intentionally allowed: two
+             * players may share a cell. Clients render the local player on
+             * top so the user always sees their own avatar. */
             clients[client_idx].p.row = (uint16_t)nr;
             clients[client_idx].p.col = (uint16_t)nc;
-            uint16_t coord =
-                (uint16_t)(nr * level_cfg.cols + nc);
+            uint16_t coord = make_cell_index((uint16_t)nr, (uint16_t)nc,
+                                             level_cfg.cols);
             broadcast_moved(clients[client_idx].p.id, coord);
             /* Walking into a lingering explosion cell (the danger zone
-             * left behind after the initial flash) kills the player. */
+             * left behind after the initial flash) kills the player.
+             * We attribute the kill to the bomb owner of the matching
+             * explosion record; arm cells (non-center) fall back to the
+             * victim's own id since we don't track them individually. */
             if (target->type == CELL_EXPLOSION) {
-                kill_players_at((uint16_t)nr, (uint16_t)nc);
+                int owner = find_explosion_owner_at((uint16_t)nr,
+                                                    (uint16_t)nc);
+                uint8_t kid = owner >= 0
+                            ? (uint8_t)owner
+                            : clients[client_idx].p.id;
+                kill_players_at(kid, (uint16_t)nr, (uint16_t)nc);
                 check_game_end();
                 return 0;
             }
@@ -1104,7 +1187,7 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             cell_t *cell = level_cell_at(&level_cfg, p->row, p->col);
             cell->type = CELL_BOMB;
 
-            uint16_t coord = (uint16_t)(p->row * level_cfg.cols + p->col);
+            uint16_t coord = make_cell_index(p->row, p->col, level_cfg.cols);
             broadcast_bomb(p->id, coord);
             log_msg("P%u -> BOMB at (%u,%u) r=%u t=%u",
                     cn, p->row, p->col, p->bomb_radius, p->bomb_timer_ticks);
@@ -1119,6 +1202,78 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
                 log_msg("P%u <- MAP + SYNC_BOARD x%d (sync)",
                         cn, active_clients_count);
             }
+            return 0;
+        }
+
+        case MSG_MAP_LIST_REQUEST: {
+            uint8_t pid = clients[client_idx].p.id;
+            if (current_game_state != GAME_LOBBY) {
+                send_error(client_fd, pid, "Map pick only in lobby");
+                return 0;
+            }
+            if (pid != lobby_leader_id()) {
+                send_error(client_fd, pid, "Only leader picks the map");
+                return 0;
+            }
+            level_entry_t entries[LEVEL_LIST_MAX];
+            int n = level_list_dir(LEVEL_DIR, entries, LEVEL_LIST_MAX);
+            if (n < 0) {
+                send_error(client_fd, pid, "Server has no maps dir");
+                return 0;
+            }
+            if (n > 255) n = 255;
+            size_t total = sizeof(msg_map_list_t) +
+                           (size_t)n * MAP_NAME_LEN;
+            uint8_t *out = (uint8_t *)calloc(1, total);
+            if (!out) {
+                send_error(client_fd, pid, "OOM");
+                return 0;
+            }
+            msg_map_list_t *m = (msg_map_list_t *)out;
+            m->hdr.msg_type  = MSG_MAP_LIST;
+            m->hdr.sender_id = ID_SERVER;
+            m->hdr.target_id = pid;
+            m->count = (uint8_t)n;
+            char *names = (char *)(out + sizeof(msg_map_list_t));
+            for (int i = 0; i < n; i++) {
+                size_t nlen = strnlen(entries[i].name, MAP_NAME_LEN - 1);
+                memcpy(names + i * MAP_NAME_LEN, entries[i].name, nlen);
+                /* Trailing zeros from calloc handle the null terminator. */
+            }
+            ssize_t wrote = write(client_fd, out, total);
+            free(out);
+            log_msg("P%u -> MAP_LIST_REQUEST; sent %d entries (%zd bytes)",
+                    pid, n, wrote);
+            return 0;
+        }
+
+        case MSG_MAP_SELECT: {
+            uint8_t pid = clients[client_idx].p.id;
+            if (current_game_state != GAME_LOBBY) {
+                send_error(client_fd, pid, "Map pick only in lobby");
+                return 0;
+            }
+            if (pid != lobby_leader_id()) {
+                send_error(client_fd, pid, "Only leader picks the map");
+                return 0;
+            }
+            const msg_map_select_t *ms =
+                (const msg_map_select_t *)buffer;
+            level_entry_t entries[LEVEL_LIST_MAX];
+            int n = level_list_dir(LEVEL_DIR, entries, LEVEL_LIST_MAX);
+            if (n <= 0) {
+                send_error(client_fd, pid, "No maps available");
+                return 0;
+            }
+            char err[96];
+            if (activate_level_index(entries, n, (int)ms->index,
+                                     NULL, 0, err, sizeof(err)) != 0) {
+                send_error(client_fd, pid, err);
+                log_msg("P%u MAP_SELECT idx=%u failed: %s",
+                        pid, ms->index, err);
+                return 0;
+            }
+            log_msg("P%u (leader) picked map idx=%u", pid, ms->index);
             return 0;
         }
 
