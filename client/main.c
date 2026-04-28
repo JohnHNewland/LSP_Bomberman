@@ -63,11 +63,7 @@ static volatile sig_atomic_t running = 1;
 static level_config_t level_cfg = {0};
 static bool level_cfg_loaded = false;
 static uint8_t my_player_id = ID_UNKNOWN;
-/* True only when we received a WINNER message in the current session for
- * the current GAME_END. Used to suppress the end-of-match popup on a
- * fresh reconnect into a stale GAME_END state - the rejoining player
- * didn't participate, so we shouldn't claim anyone "won". */
-static bool    match_winner_observed = false;
+static bool match_winner_observed = false;
 static bool me_ready = false;
 static game_status_t game_state = GAME_LOBBY;
 static uint8_t last_winner_id = ID_UNKNOWN;
@@ -88,21 +84,11 @@ typedef struct {
 
 static client_player_t players[MAX_PLAYERS + 1] = {0};
 
-/* Notification feed: fixed ring buffer of recent in-match events. Drawn in
- * the left UI column during the match so players can see who picked up
- * what bonus and who just killed whom. Reset between matches so old kill
- * messages don't bleed into the next round. */
 #define NOTIF_MAX      6
 #define NOTIF_LINE_LEN 80
 static char notif_buf[NOTIF_MAX][NOTIF_LINE_LEN];
 static int  notif_count = 0;
 
-/* Map-picker state. Populated when the leader requests the server's map
- * list (MSG_MAP_LIST_REQUEST → MSG_MAP_LIST). map_picker_open opens a
- * modal dialog that captures input until a map is chosen or cancelled.
- * Each entry mirrors msg_map_entry_t so the picker can show size and
- * player count alongside the name (per spec: "laukuma izmērs,
- * spēlētāju skaits..."). */
 #define MAP_PICKER_MAX 64
 typedef struct {
     char    name[MAP_NAME_LEN];
@@ -188,8 +174,6 @@ static void init_colors(void) {
     init_pair(PAIR_NORMAL,   COLOR_WHITE,  -1);
     init_pair(PAIR_STATUS,   COLOR_RED,    -1);
     init_pair(PAIR_INFO,     COLOR_CYAN,   -1);
-    /* Hard walls own bg=blue. Players never use bg=blue so they stay
-     * visually distinct against walls. */
     init_pair(PAIR_HARD,     COLOR_BLUE,    COLOR_BLUE);
     init_pair(PAIR_SOFT,     COLOR_BLACK,   COLOR_YELLOW);
     init_pair(PAIR_FLOOR,    COLOR_WHITE,   COLOR_BLACK);
@@ -296,7 +280,7 @@ static int send_hello(int fd, const char *player_name) {
 }
 
 static int send_ping(int fd) {
-    msg_generic_t m = { MSG_PING, ID_UNKNOWN, ID_SERVER };
+    msg_generic_t m = { MSG_PING, my_player_id, ID_SERVER };
     return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
 }
 
@@ -306,7 +290,7 @@ static int send_pong(int fd) {
 }
 
 static int send_set_ready(int fd) {
-    msg_generic_t m = { MSG_SET_READY, ID_UNKNOWN, ID_SERVER };
+    msg_generic_t m = { MSG_SET_READY, my_player_id, ID_SERVER };
     return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
 }
 
@@ -370,9 +354,6 @@ static bool i_am_leader(void) {
     return my_player_id != ID_UNKNOWN && my_player_id == leader_id();
 }
 
-/* Returns: >0 = bytes read, 0 = peer closed, -1 = nothing ready (errno=EAGAIN)
- * or real recv error (errno set accordingly).
- */
 static ssize_t poll_recv(int fd, char *buf, size_t cap) {
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -547,9 +528,6 @@ static void cell_glyphs(const cell_t *cell, int r, int c,
                         int *pair, int *attr,
                         char top[CELL_W + 1], char bot[CELL_W + 1]) {
     (void)r; (void)c;
-    /* Default: blank cell, color carries the meaning. Players and
-     * powerups override `top` with a centered glyph so the user can
-     * still tell them apart at a glance. */
     *pair = PAIR_FLOOR;
     *attr = 0;
     memcpy(top, "   ", 4);
@@ -565,9 +543,6 @@ static void cell_glyphs(const cell_t *cell, int r, int c,
             *pair = PAIR_SOFT;
             break;
         case CELL_BOMB:
-            /* Bomb shares the black floor background, so without a glyph
-             * the red-on-black colour pair would render as plain black
-             * spaces - invisible. Centre a single 'o' to mark the cell. */
             *pair = PAIR_BOMB;
             *attr = A_BOLD;
             top[1] = 'o';
@@ -613,12 +588,6 @@ static void draw_cell(int y, int x, const cell_t *cell, int r, int c) {
     attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* Render the players table in the left UI column. Returns the next free
- * y. Layout adapts to game state:
- *   - Lobby:       ID  Name             Ready
- *   - Running/End: ID  Name             St    B  R  S  F
- * Local player gets a "*" marker and is colour-paired by their id. Hides
- * itself silently if there's no vertical room. */
 static int draw_player_table(int x, int y, int max_y) {
     if (y + 3 >= max_y) return y;
 
@@ -628,9 +597,6 @@ static int draw_player_table(int x, int y, int max_y) {
 
     bool in_match = (game_state == GAME_RUNNING || game_state == GAME_END);
 
-    /* Header uses the same column widths as the data row below so labels
-     * line up over their values. Match-state stats are: St=alive/dead,
-     * Bm=bombs, Rd=blast radius, Sp=move speed, Fu=fuse ticks. */
     attron(COLOR_PAIR(PAIR_NORMAL) | A_DIM);
     if (in_match) {
         mvprintw(y++, x, "    %-3s %-14s %-4s %2s %2s %2s %3s",
@@ -657,9 +623,6 @@ static int draw_player_table(int x, int y, int max_y) {
         }
 
         attron(COLOR_PAIR(pair) | A_BOLD);
-        /* Field layout matches the header line — "P%-2u" gives 3 chars
-         * for the ID column ("P1 " through "P10"). Right-aligned %2u/%3u
-         * keep the digits flush under their header letters. */
         if (in_match) {
             const char *st = p->alive ? "OK" : "DEAD";
             if (p->alive) {
@@ -963,9 +926,6 @@ static void draw_ui(const char *host, int port, const char *player_name,
     attroff(COLOR_PAIR(PAIR_INFO) | A_BOLD);
     y += 2;
 
-    /* Per-key hints live exclusively on the bottom status bar; the left
-     * column shows session info and the player table only. */
-
     attron(COLOR_PAIR(PAIR_NORMAL));
     mvprintw(y++, x, "State: %s",
              game_state == GAME_RUNNING ? "RUNNING" :
@@ -986,17 +946,12 @@ static void draw_ui(const char *host, int port, const char *player_name,
         int oldest = notif_count - show;
         for (int i = 0; i < show && y < rows - 2; i++) {
             int slot = (oldest + i) % NOTIF_MAX;
-            /* Clip so a long event text can't run into the board area. */
             mvprintw(y++, x, "- %.38s", notif_buf[slot]);
         }
         attroff(COLOR_PAIR(PAIR_NORMAL));
     }
 
     if (game_state == GAME_RUNNING && level_cfg_loaded) {
-        /* Pushed out from the original 38 to 44 so the player table and
-         * Events feed in the left column don't get clipped behind the
-         * board. The legend's own visibility guard handles narrow
-         * terminals where 44 + frame_w exceeds the screen. */
         int map_x = 44;
         int map_y = 3;
         int avail_w = cols - map_x - 4;
@@ -1029,9 +984,6 @@ static void draw_ui(const char *host, int port, const char *player_name,
         for (int r = 0; r < dr; r++) {
             for (int c = 0; c < dc; c++) {
                 cell_t cell = *level_cell_at(&level_cfg, r, c);
-                /* Local player wins overlap rendering so the user
-                 * never loses sight of their own avatar when sharing
-                 * a cell with another player. */
                 uint8_t shown = 0;
                 if (my_player_id >= 1 && my_player_id <= MAX_PLAYERS &&
                     players[my_player_id].active &&
@@ -1057,9 +1009,6 @@ static void draw_ui(const char *host, int port, const char *player_name,
             }
         }
 
-        /* Legend sits to the right of the board so players can read the
-         * symbol-to-meaning mapping during a live match. Suppressed when
-         * the terminal is too narrow or short to fit it without overlap. */
         const int LEGEND_W = 24;
         const int LEGEND_H = 21;
         int legend_x = map_x + frame_w + 3;
@@ -1246,16 +1195,11 @@ int main(int argc, char *argv[]) {
     char status[64] = "connected";
     bool disconnected = false;
     bool welcome_received = false;
-    /* Sticky flag: set on the first MSG_ERROR so a subsequent
-     * MSG_DISCONNECT (the server's polite "I'm closing you" follow-up)
-     * doesn't clobber the actual reason in `status` with the generic
-     * "server requested disconnect" string. */
+
     bool had_error = false;
     time_t hello_sent_at  = time(NULL);
     time_t last_recv_at   = hello_sent_at;
-    /* When non-zero, time we sent a PING that hasn't been answered by any
-     * incoming traffic yet. Cleared on every read; checked against
-     * PONG_TIMEOUT_SEC to declare a peer timeout per protokols.docx. */
+
     time_t pong_pending_since = 0;
 
     while (running && !disconnected) {
@@ -1281,8 +1225,7 @@ int main(int argc, char *argv[]) {
                         if (avail < total) goto stop;
                         my_player_id = hdr->sender_id;
                         game_state = (game_status_t)w->game_status;
-                        /* New session: forget any winner from a prior
-                         * match the server may still be parked in. */
+
                         match_winner_observed = false;
                         memset(players, 0, sizeof(players));
                         if (my_player_id >= 1 &&
@@ -1318,10 +1261,7 @@ int main(int argc, char *argv[]) {
                             (const msg_hello_t *)(buf + off);
                         uint8_t id = hdr->sender_id;
                         if (id >= 1 && id <= MAX_PLAYERS) {
-                            /* HELLO may be for a freshly reused ID - wipe
-                             * the previous occupant's cached stats so we
-                             * don't render stale loadout/position until
-                             * the next SYNC_BOARD arrives. */
+
                             memset(&players[id], 0, sizeof(players[id]));
                             players[id].active = true;
                             players[id].alive  = true;
@@ -1396,9 +1336,7 @@ int main(int argc, char *argv[]) {
                         break;
                     case MSG_DISCONNECT:
                         disconnected = true;
-                        /* Preserve any ERROR reason the server already sent
-                         * (e.g. "Server full - match in progress"); only
-                         * fall back to a generic message if there isn't one. */
+
                         if (!had_error) {
                             snprintf(status, sizeof(status),
                                      "server requested disconnect");
@@ -1459,12 +1397,6 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         if (ok) {
-                            /* Only seed positions from start cells before
-                             * the match begins. Once the game is running,
-                             * SYNC_BOARDs are authoritative - touching
-                             * row/col here would snap everyone to spawn
-                             * for one frame whenever a fresh MAP arrives
-                             * (e.g. via SYNC_REQUEST recovery). */
                             bool seed_positions =
                                 (game_state != GAME_RUNNING);
                             for (size_t i = 0; i < need; i++) {
@@ -1526,18 +1458,8 @@ int main(int argc, char *argv[]) {
                             snprintf(status, sizeof(status),
                                      "You died!");
                         }
-                        /* sender_id carries the killer (bomb owner). When
-                         * server can't attribute the kill it falls back to
-                         * the victim's own id. */
-                        uint8_t killer = hdr->sender_id;
-                        if (killer == d->player_id || killer == ID_SERVER) {
-                            notif_push("%s died",
-                                       player_label(d->player_id));
-                        } else {
-                            notif_push("%s killed %s",
-                                       player_label(killer),
-                                       player_label(d->player_id));
-                        }
+
+                        notif_push("%s died", player_label(d->player_id));
                         consumed = sizeof(msg_death_t);
                         break;
                     }
@@ -1805,10 +1727,6 @@ int main(int argc, char *argv[]) {
             stop: ;
         } else if (n == 0) {
             disconnected = true;
-            /* If the server already explained itself via ERROR (e.g.
-             * "Server full - match in progress"), keep that text - the
-             * EOF we're seeing now is just the client closing its end
-             * after the explanatory disconnect. */
             if (!had_error) {
                 snprintf(status, sizeof(status),
                          "server closed connection");
@@ -1879,9 +1797,6 @@ int main(int argc, char *argv[]) {
         if (ch == 'q' || ch == 'Q') {
             cleanup(0);
         } else if ((ch == 'l' || ch == 'L') && game_state == GAME_LOBBY) {
-            /* Spec line 192: "Pirms šī ziņa ir saņemta, citas ziņas
-             * klients sūtīt nedrīkst." — no client-initiated traffic
-             * before WELCOME has arrived. */
             if (!welcome_received) {
                 snprintf(status, sizeof(status),
                          "Wait for server WELCOME before sending requests");
@@ -1920,9 +1835,6 @@ int main(int argc, char *argv[]) {
                 snprintf(status, sizeof(status), "Returning to lobby...");
             }
         } else if (ch == ' ' && game_state == GAME_LOBBY) {
-            /* SPACE in the lobby toggles ready/not-ready. Same WELCOME
-             * gate as the [L] key — spec forbids client traffic before
-             * WELCOME. */
             if (!welcome_received) {
                 snprintf(status, sizeof(status),
                          "Wait for server WELCOME before sending requests");
@@ -1987,7 +1899,6 @@ int main(int argc, char *argv[]) {
     }
 
     if (sock_fd != -1) {
-        /* Voluntary close - let the server know we're going. */
         send_leave(sock_fd);
         close(sock_fd);
         sock_fd = -1;
