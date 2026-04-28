@@ -310,6 +310,11 @@ static int send_set_ready(int fd) {
     return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
 }
 
+static int send_set_not_ready(int fd) {
+    msg_generic_t m = { MSG_SET_NOT_READY, my_player_id, ID_SERVER };
+    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
 static int send_set_status(int fd, uint8_t target_status) {
     msg_set_status_t m = {0};
     m.hdr.msg_type  = MSG_SET_STATUS;
@@ -623,11 +628,16 @@ static int draw_player_table(int x, int y, int max_y) {
 
     bool in_match = (game_state == GAME_RUNNING || game_state == GAME_END);
 
+    /* Header uses the same column widths as the data row below so labels
+     * line up over their values. Match-state stats are: St=alive/dead,
+     * Bm=bombs, Rd=blast radius, Sp=move speed, Fu=fuse ticks. */
     attron(COLOR_PAIR(PAIR_NORMAL) | A_DIM);
     if (in_match) {
-        mvaddstr(y++, x, "    ID  Name           St    B  R  S   F");
+        mvprintw(y++, x, "    %-3s %-14s %-4s %2s %2s %2s %3s",
+                 "ID", "Name", "St", "Bm", "Rd", "Sp", "Fu");
     } else {
-        mvaddstr(y++, x, "    ID  Name           Ready");
+        mvprintw(y++, x, "    %-3s %-14s %s",
+                 "ID", "Name", "Ready");
     }
     attroff(COLOR_PAIR(PAIR_NORMAL) | A_DIM);
 
@@ -647,8 +657,11 @@ static int draw_player_table(int x, int y, int max_y) {
         }
 
         attron(COLOR_PAIR(pair) | A_BOLD);
+        /* Field layout matches the header line — "P%-2u" gives 3 chars
+         * for the ID column ("P1 " through "P10"). Right-aligned %2u/%3u
+         * keep the digits flush under their header letters. */
         if (in_match) {
-            const char *st = p->alive ? "OK  " : "DEAD";
+            const char *st = p->alive ? "OK" : "DEAD";
             if (p->alive) {
                 mvprintw(y, x + 4,
                          "P%-2u %-14.14s %-4s %2u %2u %2u %3u",
@@ -657,8 +670,8 @@ static int draw_player_table(int x, int y, int max_y) {
                          p->speed, p->bomb_timer_ticks);
             } else {
                 mvprintw(y, x + 4,
-                         "P%-2u %-14.14s %-4s  -  -  -   -",
-                         (unsigned)i, name, st);
+                         "P%-2u %-14.14s %-4s %2s %2s %2s %3s",
+                         (unsigned)i, name, st, "-", "-", "-", "-");
             }
         } else {
             const char *st = p->ready ? "READY" : "...";
@@ -948,40 +961,11 @@ static void draw_ui(const char *host, int port, const char *player_name,
     mvprintw(y,     x + 9, "%s:%d", host, port);
     mvprintw(y + 1, x + 9, "%s", player_name);
     attroff(COLOR_PAIR(PAIR_INFO) | A_BOLD);
-    y += 3;
+    y += 2;
 
-    attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
-    mvaddstr(y, x, "[m]");
-    attroff(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_NORMAL));
-    mvaddstr(y++, x + 4, level_cfg_loaded
-                          ? "View map (received)"
-                          : "View map (none yet)");
-    attroff(COLOR_PAIR(PAIR_NORMAL));
+    /* Per-key hints live exclusively on the bottom status bar; the left
+     * column shows session info and the player table only. */
 
-    attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
-    mvaddstr(y, x, "[SPC]");
-    attroff(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_NORMAL));
-    if (game_state == GAME_RUNNING) {
-        mvaddstr(y++, x + 6, "In game (WASD move, SPACE bomb)");
-    } else if (game_state == GAME_END) {
-        mvaddstr(y++, x + 6, "New match (return to lobby)");
-    } else if (me_ready) {
-        mvaddstr(y++, x + 6, "Ready (waiting for others)");
-    } else {
-        mvaddstr(y++, x + 6, "Start match (set ready)");
-    }
-    attroff(COLOR_PAIR(PAIR_NORMAL));
-
-    attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
-    mvaddstr(y, x, "[q]");
-    attroff(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_NORMAL));
-    mvaddstr(y++, x + 4, "Quit");
-    attroff(COLOR_PAIR(PAIR_NORMAL));
-
-    y++;
     attron(COLOR_PAIR(PAIR_NORMAL));
     mvprintw(y++, x, "State: %s",
              game_state == GAME_RUNNING ? "RUNNING" :
@@ -1138,7 +1122,7 @@ static void draw_ui(const char *host, int port, const char *player_name,
         draw_status_bar(" [L] Choose map   [m] Map   [SPACE] Start   [q] Quit",
                         status, PAIR_STATUS);
     } else {
-        draw_status_bar(" [p] PING   [m] Map   [SPACE] Start   [q] Quit",
+        draw_status_bar(" [m] Map   [SPACE] Start   [q] Quit",
                         status, PAIR_STATUS);
     }
 
@@ -1391,6 +1375,15 @@ int main(int argc, char *argv[]) {
                             players[id].ready = true;
                         }
                         if (id == my_player_id) me_ready = true;
+                        consumed = sizeof(msg_generic_t);
+                        break;
+                    }
+                    case MSG_SET_NOT_READY: {
+                        uint8_t id = hdr->sender_id;
+                        if (id >= 1 && id <= MAX_PLAYERS) {
+                            players[id].ready = false;
+                        }
+                        if (id == my_player_id) me_ready = false;
                         consumed = sizeof(msg_generic_t);
                         break;
                     }
@@ -1886,7 +1879,13 @@ int main(int argc, char *argv[]) {
         if (ch == 'q' || ch == 'Q') {
             cleanup(0);
         } else if ((ch == 'l' || ch == 'L') && game_state == GAME_LOBBY) {
-            if (!i_am_leader()) {
+            /* Spec line 192: "Pirms šī ziņa ir saņemta, citas ziņas
+             * klients sūtīt nedrīkst." — no client-initiated traffic
+             * before WELCOME has arrived. */
+            if (!welcome_received) {
+                snprintf(status, sizeof(status),
+                         "Wait for server WELCOME before sending requests");
+            } else if (!i_am_leader()) {
                 snprintf(status, sizeof(status),
                          "Only the leader (lowest ID) picks the map");
             } else if (map_list_pending) {
@@ -1921,8 +1920,24 @@ int main(int argc, char *argv[]) {
                 snprintf(status, sizeof(status), "Returning to lobby...");
             }
         } else if (ch == ' ' && game_state == GAME_LOBBY) {
-            if (me_ready) {
-                snprintf(status, sizeof(status), "Already ready");
+            /* SPACE in the lobby toggles ready/not-ready. Same WELCOME
+             * gate as the [L] key — spec forbids client traffic before
+             * WELCOME. */
+            if (!welcome_received) {
+                snprintf(status, sizeof(status),
+                         "Wait for server WELCOME before sending requests");
+            } else if (me_ready) {
+                if (send_set_not_ready(sock_fd) == 0) {
+                    me_ready = false;
+                    snprintf(status, sizeof(status), "Unready");
+                } else {
+                    snprintf(status, sizeof(status),
+                             "SET_NOT_READY failed: %s", strerror(errno));
+                    if (errno == EPIPE || errno == ECONNRESET ||
+                        errno == EBADF  || errno == ENOTCONN) {
+                        disconnected = true;
+                    }
+                }
             } else if (send_set_ready(sock_fd) == 0) {
                 me_ready = true;
                 snprintf(status, sizeof(status),

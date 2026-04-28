@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -79,6 +80,13 @@ typedef struct {
     uint16_t row, col;
     uint8_t  radius;
     uint16_t end_in_ticks;
+    /* Soft-block cells consumed by this blast. Held here until the
+     * danger period ends so BLOCK_DESTROYED fires at the moment the
+     * spec requires (line 66: "iznīcināms bloks tiek iznīcināts —
+     * brīdī, kad sprādziena bīstamības laiks beidzas"). One soft
+     * block per direction max, since a soft block stops the spread. */
+    uint8_t  soft_count;
+    uint16_t soft_cells[4];
 } server_explosion_t;
 
 static server_bomb_t      bombs[MAX_BOMBS];
@@ -164,10 +172,12 @@ static int broadcast_explosion(uint8_t type, uint8_t owner_id,
     return sent;
 }
 
-static int broadcast_block_destroyed(uint16_t cell) {
+static int broadcast_block_destroyed(uint8_t owner_id, uint16_t cell) {
     msg_block_destroyed_t m = {0};
     m.hdr.msg_type  = MSG_BLOCK_DESTROYED;
-    m.hdr.sender_id = ID_SERVER;
+    /* Pārsūtāma per spec: sender_id is the originator of the event,
+     * which for a destroyed soft block is the bomb owner. */
+    m.hdr.sender_id = owner_id;
     m.hdr.target_id = ID_BROADCAST;
     m.cell          = htons(cell);
     int sent = 0;
@@ -309,7 +319,8 @@ static int find_explosion_owner_at(uint16_t row, uint16_t col) {
 }
 
 static int add_explosion(uint8_t owner_id, uint16_t row, uint16_t col,
-                         uint8_t radius, uint16_t danger) {
+                         uint8_t radius, uint16_t danger,
+                         const uint16_t *soft_cells, uint8_t soft_count) {
     for (int i = 0; i < MAX_EXPLOSIONS; i++) {
         if (!explosions[i].active) {
             explosions[i].active = true;
@@ -318,6 +329,10 @@ static int add_explosion(uint8_t owner_id, uint16_t row, uint16_t col,
             explosions[i].col = col;
             explosions[i].radius = radius;
             explosions[i].end_in_ticks = danger ? danger : 1;
+            explosions[i].soft_count = soft_count;
+            for (uint8_t k = 0; k < soft_count && k < 4; k++) {
+                explosions[i].soft_cells[k] = soft_cells[k];
+            }
             return i;
         }
     }
@@ -345,6 +360,11 @@ static void detonate_bomb(int idx) {
 
     kill_players_at(b.owner_id, b.row, b.col);
 
+    /* Soft-block cells eaten by this blast — accumulated and handed to
+     * add_explosion so BLOCK_DESTROYED fires at end of danger window. */
+    uint16_t soft_cells[4];
+    uint8_t  soft_count = 0;
+
     static const uint8_t dirs[] = { DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
     for (int d = 0; d < 4; d++) {
         int dr, dc;
@@ -361,9 +381,9 @@ static void detonate_bomb(int idx) {
             if (chain >= 0) bombs[chain].timer_ticks = 1;
 
             bool was_soft = (t->type == CELL_SOFT_BLOCK);
-            if (was_soft) {
-                broadcast_block_destroyed(
-                    make_cell_index((uint16_t)r, (uint16_t)c, level_cfg.cols));
+            if (was_soft && soft_count < 4) {
+                soft_cells[soft_count++] =
+                    make_cell_index((uint16_t)r, (uint16_t)c, level_cfg.cols);
             }
             /* Overwrite the cell with the live explosion. Soft blocks,
              * bonuses, and empty cells all become danger zones; bombs at
@@ -377,7 +397,8 @@ static void detonate_bomb(int idx) {
 
     uint16_t danger = b.danger_ticks;
     if (danger == 0) danger = DEFAULT_DANGER_TICKS;
-    add_explosion(b.owner_id, b.row, b.col, b.radius, danger);
+    add_explosion(b.owner_id, b.row, b.col, b.radius, danger,
+                  soft_cells, soft_count);
     check_game_end();
 }
 
@@ -422,6 +443,13 @@ static void server_tick(void) {
             uint16_t cell = make_cell_index(explosions[i].row,
                                             explosions[i].col,
                                             level_cfg.cols);
+            /* Spec line 66: soft block is destroyed at the moment the
+             * danger window ends. Fire BLOCK_DESTROYED here so the
+             * client perceives destruction in the right beat. */
+            for (uint8_t k = 0; k < explosions[i].soft_count; k++) {
+                broadcast_block_destroyed(explosions[i].owner_id,
+                                          explosions[i].soft_cells[k]);
+            }
             clear_explosion_cells(explosions[i].row, explosions[i].col,
                                   explosions[i].radius);
             broadcast_explosion(MSG_EXPLOSION_END,
@@ -604,7 +632,13 @@ static int send_welcome(int fd, uint8_t to_id) {
         if (clients[i].fd == -1 || clients[i].p.id == to_id) continue;
         msg_other_client_t oc = {0};
         oc.id = clients[i].p.id;
-        oc.ready = clients[i].p.ready ? 1 : 0;
+        /* Spec line 194: outside the lobby, "klients ir gatavs tad un
+         * tikai tad, ja tas piedalās spēlē" — every existing slot is a
+         * participant, so report ready=true. In lobby, expose the
+         * actual ready toggle. */
+        oc.ready = (current_game_state == GAME_LOBBY)
+                   ? (clients[i].p.ready ? 1 : 0)
+                   : 1;
         snprintf(oc.name, sizeof(oc.name), "%s", clients[i].p.name);
         memcpy(buf + off, &oc, sizeof(oc));
         off += sizeof(oc);
@@ -949,6 +983,7 @@ static ssize_t msg_wire_len(uint8_t type, const char *buf, ssize_t avail) {
         case MSG_LEAVE:
         case MSG_DISCONNECT:
         case MSG_SET_READY:
+        case MSG_SET_NOT_READY:
         case MSG_SYNC_REQUEST:
         case MSG_MAP_LIST_REQUEST: return (ssize_t)sizeof(msg_generic_t);
         case MSG_SET_STATUS:       return (ssize_t)sizeof(msg_set_status_t);
@@ -1001,6 +1036,23 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
                 send_disconnect(client_fd, ID_UNKNOWN);
                 log_msg("Rejected join during running match");
                 return -1;
+            }
+
+            /* Spec line 54: "unikāls lietotājvārds" — usernames must be
+             * unique within the room. Reject case-insensitively before
+             * we hand out a player id; otherwise duplicate names would
+             * confuse the player table and notification feed. */
+            for (int i = 0; i < active_clients_count; i++) {
+                if (i == client_idx) continue;
+                if (clients[i].fd == -1) continue;
+                if (clients[i].p.id == 0) continue;
+                if (strcasecmp(clients[i].p.name, player_name) == 0) {
+                    send_error(client_fd, ID_UNKNOWN,
+                               "Name already taken");
+                    send_disconnect(client_fd, ID_UNKNOWN);
+                    log_msg("Rejected duplicate name: %s", player_name);
+                    return -1;
+                }
             }
 
             /* Pick the lowest free player ID (and one that has a start
@@ -1090,6 +1142,17 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             clients[client_idx].p.ready = true;
             broadcast_simple(MSG_SET_READY, clients[client_idx].p.id);
             check_match_start();
+            return 0;
+        }
+
+        case MSG_SET_NOT_READY: {
+            log_msg("P%u -> SET_NOT_READY", cn);
+            /* Toggling off only makes sense in the lobby; outside it the
+             * client can no longer be "ready in waiting", so silently
+             * ignore. */
+            if (current_game_state != GAME_LOBBY) return 0;
+            clients[client_idx].p.ready = false;
+            broadcast_simple(MSG_SET_NOT_READY, clients[client_idx].p.id);
             return 0;
         }
 

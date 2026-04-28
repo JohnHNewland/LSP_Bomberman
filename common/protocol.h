@@ -52,6 +52,11 @@ typedef enum {
     MSG_ERROR            = 6,
     MSG_MAP              = 7,
     MSG_SET_READY        = 10,
+    /* Spec only defines SET_READY; this extension lets a player toggle
+     * back to "not ready" while still in the lobby. ID 11 sits next to
+     * SET_READY and outside the rest of the spec's lobby-numbered
+     * range so future spec types can't collide. */
+    MSG_SET_NOT_READY    = 11,
     MSG_SET_STATUS       = 20,
     MSG_WINNER           = 23,
     MSG_MOVE_ATTEMPT     = 30,
