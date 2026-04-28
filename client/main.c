@@ -441,15 +441,14 @@ static void draw_status_bar(const char *help, const char *msg, int msg_pair) {
     }
 }
 
-#define MENU_ITEM_COUNT 5
+#define MENU_ITEM_COUNT 4
 static const char *MENU_ITEMS[MENU_ITEM_COUNT] = {
     "Join server",
     "Edit server address",
     "Edit player name",
-    "Load level config",
     "Quit",
 };
-static const char MENU_HOTKEYS[MENU_ITEM_COUNT] = { 'j', 'h', 'n', 'l', 'q' };
+static const char MENU_HOTKEYS[MENU_ITEM_COUNT] = { 'j', 'h', 'n', 'q' };
 
 static void draw_menu(const char *host, int port,
                       const char *player_name, int sel,
@@ -783,78 +782,6 @@ static void preview_level(void) {
     }
 
     nodelay(stdscr, TRUE);
-}
-
-static void load_config_dialog(char *status, size_t status_cap, int *status_pair) {
-    level_entry_t entries[LEVEL_LIST_MAX];
-    int n = level_list_dir(LEVEL_DIR, entries, LEVEL_LIST_MAX);
-    if (n < 0) {
-        snprintf(status, status_cap, "Cannot open '%s/'", LEVEL_DIR);
-        *status_pair = PAIR_STATUS;
-        return;
-    }
-    if (n == 0) {
-        snprintf(status, status_cap, "No .map files in '%s/'", LEVEL_DIR);
-        *status_pair = PAIR_STATUS;
-        return;
-    }
-
-    nodelay(stdscr, FALSE);
-    int sel = 0;
-    while (1) {
-        erase();
-        int rows, cols;
-        getmaxyx(stdscr, rows, cols);
-        draw_box(0, 0, rows - 1, cols);
-        draw_centered(2, cols, "=== Pick Level Config ===", PAIR_TITLE, A_BOLD);
-        int x = cols / 2 - 20;
-        if (x < 4) x = 4;
-        mvprintw(4, x, "Folder: %s/  (%d file%s)",
-                 LEVEL_DIR, n, n == 1 ? "" : "s");
-        for (int i = 0; i < n; i++) {
-            int y = 6 + i;
-            if (i == sel) {
-                attron(COLOR_PAIR(PAIR_SELECTED) | A_BOLD);
-                mvprintw(y, x, "  > %-30s ", entries[i].name);
-                attroff(COLOR_PAIR(PAIR_SELECTED) | A_BOLD);
-            } else {
-                attron(COLOR_PAIR(PAIR_NORMAL));
-                mvprintw(y, x, "    %-30s ", entries[i].name);
-                attroff(COLOR_PAIR(PAIR_NORMAL));
-            }
-        }
-        draw_status_bar(" [Up/Down] Move   [Enter] Select   [q/Esc] Cancel",
-                        "", PAIR_INFO);
-        refresh();
-
-        int ch = getch();
-        if (ch == KEY_UP)        sel = (sel - 1 + n) % n;
-        else if (ch == KEY_DOWN) sel = (sel + 1) % n;
-        else if (ch == 27 || ch == 'q' || ch == 'Q') {
-            nodelay(stdscr, TRUE);
-            return;
-        }
-        else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) break;
-    }
-    nodelay(stdscr, TRUE);
-
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s", LEVEL_DIR, entries[sel].name);
-
-    level_config_t tmp = {0};
-    char err[96];
-    if (level_config_load(path, &tmp, err, sizeof(err)) == 0) {
-        level_config_free(&level_cfg);
-        level_cfg = tmp;
-        level_cfg_loaded = true;
-        snprintf(status, status_cap, "Loaded %s (%ux%u)",
-                 entries[sel].name, level_cfg.rows, level_cfg.cols);
-        *status_pair = PAIR_INFO;
-        preview_level();
-        return;
-    }
-    snprintf(status, status_cap, "Load failed: %s", err);
-    *status_pair = PAIR_STATUS;
 }
 
 static void edit_server(char *host_buf, size_t host_cap, int *port) {
@@ -1237,11 +1164,8 @@ int main(int argc, char *argv[]) {
             case 'n': case 'N':
                 activate_idx = 2;
                 break;
-            case 'l': case 'L':
-                activate_idx = 3;
-                break;
             case 'q': case 'Q':
-                activate_idx = 4;
+                activate_idx = 3;
                 break;
             default:
                 break;
@@ -1278,10 +1202,6 @@ int main(int argc, char *argv[]) {
             sel = 2;
             edit_name(player_name, sizeof(player_name));
         } else if (activate_idx == 3) {
-            sel = 3;
-            load_config_dialog(menu_status, sizeof(menu_status),
-                               &menu_status_pair);
-        } else if (activate_idx == 4) {
             cleanup(0);
         }
 
