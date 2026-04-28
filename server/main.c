@@ -912,6 +912,44 @@ void reset_client_data(int index) {
     memset(&clients[index].p, 0, sizeof(player_t));
 }
 
+/* Wire-byte length of a message of the given type, given the bytes we
+ * have buffered so far (avail). Returns:
+ *   > 0 — the full length of the message; caller should slice that many
+ *         bytes off buffer and dispatch them.
+ *     0 — not enough buffered yet to know (e.g. variable-length header);
+ *         caller should wait for more bytes.
+ *    -1 — unknown / illegal type.
+ */
+static ssize_t msg_wire_len(uint8_t type, const char *buf, ssize_t avail) {
+    switch (type) {
+        case MSG_HELLO:
+            return HEADER_LEN + CLIENT_ID_LEN + PLAYER_NAME_LEN;
+        case MSG_PING:
+        case MSG_PONG:
+        case MSG_LEAVE:
+        case MSG_DISCONNECT:
+        case MSG_SET_READY:
+        case MSG_SYNC_REQUEST:
+        case MSG_MAP_LIST_REQUEST:
+            return HEADER_LEN;
+        case MSG_SET_STATUS:
+        case MSG_MOVE_ATTEMPT:
+            return HEADER_LEN + 1;
+        case MSG_BOMB_ATTEMPT:
+            return HEADER_LEN + 2;
+        case MSG_MAP_SELECT:
+            return HEADER_LEN + MAP_NAME_LEN;
+        case MSG_ERROR: {
+            if (avail < HEADER_LEN + 2) return 0;
+            uint16_t elen = ((uint16_t)(uint8_t)buf[HEADER_LEN] << 8) |
+                            (uint16_t)(uint8_t)buf[HEADER_LEN + 1];
+            return HEADER_LEN + 2 + elen;
+        }
+        default:
+            return -1;
+    }
+}
+
 int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
     if (len <= 0) return -1;
     if (len < 1) return -1;
@@ -1207,12 +1245,16 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
 
         case MSG_MAP_LIST_REQUEST: {
             uint8_t pid = clients[client_idx].p.id;
+            log_msg("P%u -> MAP_LIST_REQUEST (state=%d, leader=%u)",
+                    pid, (int)current_game_state, lobby_leader_id());
             if (current_game_state != GAME_LOBBY) {
                 send_error(client_fd, pid, "Map pick only in lobby");
+                log_msg("P%u <- ERROR (not lobby)", pid);
                 return 0;
             }
             if (pid != lobby_leader_id()) {
                 send_error(client_fd, pid, "Only leader picks the map");
+                log_msg("P%u <- ERROR (not leader)", pid);
                 return 0;
             }
             level_entry_t entries[LEVEL_LIST_MAX];
@@ -1223,7 +1265,7 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             }
             if (n > 255) n = 255;
             size_t total = sizeof(msg_map_list_t) +
-                           (size_t)n * MAP_NAME_LEN;
+                           (size_t)n * sizeof(msg_map_entry_t);
             uint8_t *out = (uint8_t *)calloc(1, total);
             if (!out) {
                 send_error(client_fd, pid, "OOM");
@@ -1233,17 +1275,36 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             m->hdr.msg_type  = MSG_MAP_LIST;
             m->hdr.sender_id = ID_SERVER;
             m->hdr.target_id = pid;
-            m->count = (uint8_t)n;
-            char *names = (char *)(out + sizeof(msg_map_list_t));
+            msg_map_entry_t *items =
+                (msg_map_entry_t *)(out + sizeof(msg_map_list_t));
+            int kept = 0;
             for (int i = 0; i < n; i++) {
+                char path[256];
+                snprintf(path, sizeof(path), "%s/%.*s",
+                         LEVEL_DIR, MAP_NAME_LEN - 1, entries[i].name);
+                level_config_t probe = {0};
+                char perr[64];
+                if (level_config_load(path, &probe,
+                                      perr, sizeof(perr)) != 0) {
+                    log_msg("Skipping unreadable map %s: %s",
+                            entries[i].name, perr);
+                    continue;
+                }
+                msg_map_entry_t *e = &items[kept++];
                 size_t nlen = strnlen(entries[i].name, MAP_NAME_LEN - 1);
-                memcpy(names + i * MAP_NAME_LEN, entries[i].name, nlen);
-                /* Trailing zeros from calloc handle the null terminator. */
+                memcpy(e->name, entries[i].name, nlen);
+                e->rows        = probe.rows;
+                e->cols        = probe.cols;
+                e->max_players = (uint8_t)count_player_starts(&probe);
+                level_config_free(&probe);
             }
+            m->count = (uint8_t)kept;
+            total = sizeof(msg_map_list_t) +
+                    (size_t)kept * sizeof(msg_map_entry_t);
             ssize_t wrote = write(client_fd, out, total);
             free(out);
             log_msg("P%u -> MAP_LIST_REQUEST; sent %d entries (%zd bytes)",
-                    pid, n, wrote);
+                    pid, kept, wrote);
             return 0;
         }
 
@@ -1259,21 +1320,34 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             }
             const msg_map_select_t *ms =
                 (const msg_map_select_t *)buffer;
+            char wanted[MAP_NAME_LEN];
+            memcpy(wanted, ms->name, MAP_NAME_LEN - 1);
+            wanted[MAP_NAME_LEN - 1] = '\0';
             level_entry_t entries[LEVEL_LIST_MAX];
             int n = level_list_dir(LEVEL_DIR, entries, LEVEL_LIST_MAX);
             if (n <= 0) {
                 send_error(client_fd, pid, "No maps available");
                 return 0;
             }
-            char err[96];
-            if (activate_level_index(entries, n, (int)ms->index,
-                                     NULL, 0, err, sizeof(err)) != 0) {
-                send_error(client_fd, pid, err);
-                log_msg("P%u MAP_SELECT idx=%u failed: %s",
-                        pid, ms->index, err);
+            int idx = -1;
+            for (int i = 0; i < n; i++) {
+                if (strcmp(entries[i].name, wanted) == 0) { idx = i; break; }
+            }
+            if (idx < 0) {
+                send_error(client_fd, pid, "Unknown map name");
+                log_msg("P%u MAP_SELECT '%s' failed: not found",
+                        pid, wanted);
                 return 0;
             }
-            log_msg("P%u (leader) picked map idx=%u", pid, ms->index);
+            char err[96];
+            if (activate_level_index(entries, n, idx,
+                                     NULL, 0, err, sizeof(err)) != 0) {
+                send_error(client_fd, pid, err);
+                log_msg("P%u MAP_SELECT '%s' failed: %s",
+                        pid, wanted, err);
+                return 0;
+            }
+            log_msg("P%u (leader) picked map '%s'", pid, wanted);
             return 0;
         }
 
@@ -1508,7 +1582,30 @@ int main(int argc, char *argv[]) {
                 if (bytes_read > 0) {
                     clients[i].last_recv_at = time(NULL);
                     clients[i].pong_pending_since = 0;
-                    process_message(i, sock, buffer, bytes_read);
+                    /* Drain ALL messages in this read — TCP may have
+                     * coalesced more than one. The previous code only
+                     * processed buffer[0] and dropped the rest, which is
+                     * what made MAP_LIST_REQUESTs sent right after a
+                     * PING vanish silently. */
+                    ssize_t off = 0;
+                    while (off < bytes_read) {
+                        if (bytes_read - off < HEADER_LEN) break;
+                        uint8_t mtype = (uint8_t)buffer[off];
+                        ssize_t mlen = msg_wire_len(mtype, buffer + off,
+                                                    bytes_read - off);
+                        if (mlen <= 0) {
+                            /* Unknown type or partial variable-length
+                             * header. Hand it to process_message so it
+                             * still logs "unknown" for visibility, then
+                             * stop draining this read. */
+                            process_message(i, sock, buffer + off,
+                                            bytes_read - off);
+                            break;
+                        }
+                        if (mlen > bytes_read - off) break;
+                        process_message(i, sock, buffer + off, mlen);
+                        off += mlen;
+                    }
                 } else if (bytes_read == 0) {
                     uint8_t leaving = clients[i].p.id;
                     if (leaving != 0) {

@@ -98,9 +98,18 @@ static int  notif_count = 0;
 
 /* Map-picker state. Populated when the leader requests the server's map
  * list (MSG_MAP_LIST_REQUEST → MSG_MAP_LIST). map_picker_open opens a
- * modal dialog that captures input until a map is chosen or cancelled. */
+ * modal dialog that captures input until a map is chosen or cancelled.
+ * Each entry mirrors msg_map_entry_t so the picker can show size and
+ * player count alongside the name (per spec: "laukuma izmērs,
+ * spēlētāju skaits..."). */
 #define MAP_PICKER_MAX 64
-static char map_picker_names[MAP_PICKER_MAX][MAP_NAME_LEN];
+typedef struct {
+    char    name[MAP_NAME_LEN];
+    uint8_t rows;
+    uint8_t cols;
+    uint8_t max_players;
+} map_picker_entry_t;
+static map_picker_entry_t map_picker_entries[MAP_PICKER_MAX];
 static int  map_picker_count = 0;
 static int  map_picker_sel   = 0;
 static bool map_picker_open  = false;
@@ -332,12 +341,13 @@ static int send_map_list_request(int fd) {
     return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
 }
 
-static int send_map_select(int fd, uint8_t index) {
+static int send_map_select(int fd, const char *name) {
     msg_map_select_t m = {0};
     m.hdr.msg_type  = MSG_MAP_SELECT;
     m.hdr.sender_id = my_player_id;
     m.hdr.target_id = ID_SERVER;
-    m.index = index;
+    size_t nlen = strnlen(name, MAP_NAME_LEN - 1);
+    memcpy(m.name, name, nlen);
     return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
 }
 
@@ -630,11 +640,13 @@ static void draw_map_picker(void) {
     attron(COLOR_PAIR(PAIR_NORMAL));
     for (int i = first; i < last; i++) {
         int row = by + 3 + (i - first);
+        const map_picker_entry_t *e = &map_picker_entries[i];
         if (i == map_picker_sel)
             attron(A_REVERSE | A_BOLD);
-        mvprintw(row, bx + 2, " %c %-*s ",
+        mvprintw(row, bx + 2,
+                 " %c %-28s  %3ux%-3u  up to %u ",
                  (i == map_picker_sel) ? '>' : ' ',
-                 box_w - 8, map_picker_names[i]);
+                 e->name, e->rows, e->cols, e->max_players);
         if (i == map_picker_sel)
             attroff(A_REVERSE | A_BOLD);
     }
@@ -1715,17 +1727,22 @@ int main(int argc, char *argv[]) {
                         const msg_map_list_t *ml =
                             (const msg_map_list_t *)(buf + off);
                         size_t total = sizeof(msg_map_list_t) +
-                            (size_t)ml->count * MAP_NAME_LEN;
+                            (size_t)ml->count * sizeof(msg_map_entry_t);
                         if (avail < total) goto stop;
                         int n = ml->count;
                         if (n > MAP_PICKER_MAX) n = MAP_PICKER_MAX;
-                        const char *src = (const char *)(buf + off
+                        const msg_map_entry_t *src =
+                            (const msg_map_entry_t *)(buf + off
                                                 + sizeof(msg_map_list_t));
                         for (int i = 0; i < n; i++) {
-                            memcpy(map_picker_names[i],
-                                   src + i * MAP_NAME_LEN,
+                            memcpy(map_picker_entries[i].name, src[i].name,
                                    MAP_NAME_LEN);
-                            map_picker_names[i][MAP_NAME_LEN - 1] = '\0';
+                            map_picker_entries[i].name[MAP_NAME_LEN - 1]
+                                = '\0';
+                            map_picker_entries[i].rows        = src[i].rows;
+                            map_picker_entries[i].cols        = src[i].cols;
+                            map_picker_entries[i].max_players =
+                                src[i].max_players;
                         }
                         map_picker_count = n;
                         map_picker_sel   = 0;
@@ -1845,14 +1862,14 @@ int main(int argc, char *argv[]) {
                 snprintf(status, sizeof(status), "Map pick cancelled");
             } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
                 if (map_picker_count > 0) {
-                    if (send_map_select(sock_fd,
-                                        (uint8_t)map_picker_sel) != 0) {
+                    const char *picked =
+                        map_picker_entries[map_picker_sel].name;
+                    if (send_map_select(sock_fd, picked) != 0) {
                         snprintf(status, sizeof(status),
                                  "MAP_SELECT failed: %s", strerror(errno));
                     } else {
                         snprintf(status, sizeof(status),
-                                 "Picked: %s",
-                                 map_picker_names[map_picker_sel]);
+                                 "Picked: %s", picked);
                     }
                 }
                 map_picker_open = false;

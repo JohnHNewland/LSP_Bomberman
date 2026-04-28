@@ -188,15 +188,27 @@ typedef struct {
 
 #define MAP_NAME_LEN 64
 
+/* One entry per available map in the server's maps/ folder. Per spec
+ * (protokols.docx, "Serveris nodod klientam... laukuma izmērs,
+ * spēlētāju skaits, laukuma izkārtojums"): size and player count are
+ * included here so the leader can pick informed; the layout itself
+ * arrives in MAP after the leader sends MAP_SELECT. */
+typedef struct {
+    char     name[MAP_NAME_LEN];
+    uint8_t  rows;
+    uint8_t  cols;
+    uint8_t  max_players;
+} msg_map_entry_t;
+
 typedef struct {
     msg_generic_t hdr;
     uint8_t       count;
-    /* Followed by count * char[MAP_NAME_LEN]. */
+    /* Followed by count * msg_map_entry_t. */
 } msg_map_list_t;
 
 typedef struct {
     msg_generic_t hdr;
-    uint8_t       index;
+    char          name[MAP_NAME_LEN];
 } msg_map_select_t;
 
 typedef struct {
