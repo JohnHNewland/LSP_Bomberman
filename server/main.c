@@ -921,24 +921,23 @@ void reset_client_data(int index) {
  *    -1 — unknown / illegal type.
  */
 static ssize_t msg_wire_len(uint8_t type, const char *buf, ssize_t avail) {
+    /* Use sizeof on the actual structs so the dispatcher matches what the
+     * peer wrote with `write(fd, &m, sizeof(m))` — including any struct
+     * padding the compiler inserts (e.g. msg_bomb_attempt_t pads from 5
+     * to 6 bytes for uint16_t alignment). */
     switch (type) {
-        case MSG_HELLO:
-            return HEADER_LEN + CLIENT_ID_LEN + PLAYER_NAME_LEN;
+        case MSG_HELLO:            return (ssize_t)sizeof(msg_hello_t);
         case MSG_PING:
         case MSG_PONG:
         case MSG_LEAVE:
         case MSG_DISCONNECT:
         case MSG_SET_READY:
         case MSG_SYNC_REQUEST:
-        case MSG_MAP_LIST_REQUEST:
-            return HEADER_LEN;
-        case MSG_SET_STATUS:
-        case MSG_MOVE_ATTEMPT:
-            return HEADER_LEN + 1;
-        case MSG_BOMB_ATTEMPT:
-            return HEADER_LEN + 2;
-        case MSG_MAP_SELECT:
-            return HEADER_LEN + MAP_NAME_LEN;
+        case MSG_MAP_LIST_REQUEST: return (ssize_t)sizeof(msg_generic_t);
+        case MSG_SET_STATUS:       return (ssize_t)sizeof(msg_set_status_t);
+        case MSG_MOVE_ATTEMPT:     return (ssize_t)sizeof(msg_move_attempt_t);
+        case MSG_BOMB_ATTEMPT:     return (ssize_t)sizeof(msg_bomb_attempt_t);
+        case MSG_MAP_SELECT:       return (ssize_t)sizeof(msg_map_select_t);
         case MSG_ERROR: {
             if (avail < HEADER_LEN + 2) return 0;
             uint16_t elen = ((uint16_t)(uint8_t)buf[HEADER_LEN] << 8) |
