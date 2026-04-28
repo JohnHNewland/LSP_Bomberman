@@ -32,9 +32,18 @@
 #define SERVER_ID_STR "bbm-server-0.1"
 
 typedef struct {
-    int fd;
+    int      fd;
     player_t p;
+    time_t   last_recv_at;
+    /* When non-zero, holds the time we sent a PING that has not yet been
+     * answered by any incoming traffic. Cleared on every read. Per
+     * protokols.docx, no PONG within 30 s of a PING is the only timeout
+     * condition — silence alone is not. */
+    time_t   pong_pending_since;
 } client_t;
+
+#define IDLE_BEFORE_PING_SEC 15
+#define PONG_TIMEOUT_SEC     30
 
 static int server_fd = -1;
 static client_t clients[MAX_CLIENTS];
@@ -59,6 +68,7 @@ typedef struct {
     uint16_t row, col;
     uint8_t  radius;
     uint16_t timer_ticks;
+    uint16_t danger_ticks;
 } server_bomb_t;
 
 typedef struct {
@@ -99,7 +109,9 @@ static int send_error(int fd, uint8_t target_id, const char *err) {
 
 static int  send_map_to(int fd, uint8_t target_id);
 static void broadcast_map(void);
-static void assign_player_starts(void);
+static void place_players_at_starts(void);
+static void place_one_player_at_start(int client_idx);
+static uint8_t pick_free_player_id(void);
 static void check_game_end(void);
 static void check_match_start(void);
 static void restore_level_from_pristine(void);
@@ -176,6 +188,52 @@ static int broadcast_death(uint8_t player_id) {
     return sent;
 }
 
+static void fill_sync_board(msg_sync_board_t *m, const player_t *p) {
+    m->hdr.msg_type  = MSG_SYNC_BOARD;
+    m->hdr.sender_id = ID_SERVER;
+    m->hdr.target_id = ID_BROADCAST;
+    m->player_id          = p->id;
+    m->alive              = p->alive ? 1 : 0;
+    m->lives              = p->lives;
+    m->row                = htons(p->row);
+    m->col                = htons(p->col);
+    m->bomb_count         = p->bomb_count;
+    m->bomb_radius        = p->bomb_radius;
+    m->bomb_timer_ticks   = htons(p->bomb_timer_ticks);
+    m->speed              = htons(p->speed);
+    m->danger_extra_ticks = htons(p->danger_extra_ticks);
+}
+
+static int send_sync_board_to(int fd, uint8_t target_id, const player_t *p) {
+    msg_sync_board_t m = {0};
+    fill_sync_board(&m, p);
+    m.hdr.target_id = target_id;
+    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
+static void broadcast_sync_board_for(const player_t *p) {
+    msg_sync_board_t m = {0};
+    fill_sync_board(&m, p);
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd == -1) continue;
+        write(clients[i].fd, &m, sizeof(m));
+    }
+}
+
+static void broadcast_sync_board_all(void) {
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd == -1) continue;
+        broadcast_sync_board_for(&clients[i].p);
+    }
+}
+
+static void send_sync_board_all_to(int fd, uint8_t target_id) {
+    for (int i = 0; i < active_clients_count; i++) {
+        if (clients[i].fd == -1) continue;
+        send_sync_board_to(fd, target_id, &clients[i].p);
+    }
+}
+
 static int broadcast_bonus_retrieved(uint8_t player_id, uint16_t cell) {
     msg_bonus_retrieved_t m = {0};
     m.hdr.msg_type  = MSG_BONUS_RETRIEVED;
@@ -195,7 +253,9 @@ static void apply_bonus(player_t *p, cell_type_t bonus) {
     switch (bonus) {
         case CELL_BONUS_SPEED:  p->speed++; break;
         case CELL_BONUS_RADIUS: p->bomb_radius++; break;
-        case CELL_BONUS_TIMER:  p->bomb_timer_ticks += 10; break;
+        /* TIMER bonus extends how long the explosion lingers (danger
+         * window) by 10 ticks, applied when this player's bomb detonates. */
+        case CELL_BONUS_TIMER:  p->danger_extra_ticks += 10; break;
         case CELL_BONUS_BOMBS:  p->bomb_count++; break;
         default: break;
     }
@@ -293,7 +353,7 @@ static void detonate_bomb(int idx) {
         }
     }
 
-    uint16_t danger = level_cfg.danger_ticks;
+    uint16_t danger = b.danger_ticks;
     if (danger == 0) danger = DEFAULT_DANGER_TICKS;
     add_explosion(b.row, b.col, b.radius, danger);
     check_game_end();
@@ -407,7 +467,7 @@ static void return_to_lobby(void) {
     }
     if (level_cfg_loaded) {
         restore_level_from_pristine();
-        assign_player_starts();
+        place_players_at_starts();
     }
     broadcast_set_status(GAME_LOBBY);
     if (level_cfg_loaded) broadcast_map();
@@ -423,6 +483,19 @@ static void check_match_start(void) {
     }
     if (ready_count != active_clients_count) return;
 
+    /* Refuse to enter RUNNING without a level — clients would otherwise
+     * receive SET_STATUS=1 and immediately go off the rails since they
+     * have no map. The host needs to load a level first. */
+    if (!level_cfg_loaded) {
+        for (int i = 0; i < active_clients_count; i++) {
+            if (clients[i].fd == -1) continue;
+            send_error(clients[i].fd, clients[i].p.id,
+                       "Host has not loaded a level yet");
+        }
+        log_msg("All ready, but no level loaded - match start blocked.");
+        return;
+    }
+
     current_game_state = GAME_RUNNING;
     broadcast_set_status(GAME_RUNNING);
     log_msg("All %d player(s) ready - match started.", ready_count);
@@ -430,6 +503,9 @@ static void check_match_start(void) {
         if (clients[i].fd == -1) continue;
         if (level_cfg_loaded) send_map_to(clients[i].fd, clients[i].p.id);
     }
+    /* Send a SYNC_BOARD for every player so all clients (including any
+     * late joiner) have authoritative positions and stats. */
+    broadcast_sync_board_all();
 }
 
 static int send_welcome(int fd, uint8_t to_id) {
@@ -458,12 +534,18 @@ static int send_welcome(int fd, uint8_t to_id) {
     return (write(fd, buf, off) == (ssize_t)off) ? 0 : -1;
 }
 
+static void send_disconnect(int fd, uint8_t target_id) {
+    msg_generic_t m = { MSG_DISCONNECT, ID_SERVER, target_id };
+    write(fd, &m, sizeof(m));
+}
+
 void cleanup(int sig) {
     (void)sig;
     printf("\nServer shutting down...\n");
-    
+
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].fd != -1) {
+            send_disconnect(clients[i].fd, clients[i].p.id);
             close(clients[i].fd);
             clients[i].fd = -1;
         }
@@ -541,11 +623,11 @@ static int count_player_starts(const level_config_t *cfg) {
     return n;
 }
 
-static void assign_player_starts(void) {
+/* Map ID (1..LEVEL_MAX_PLAYERS) to its start cell (linear index + 1, or
+ * 0 if that slot doesn't exist on the current map). */
+static void compute_start_positions(int starts[LEVEL_MAX_PLAYERS + 1]) {
+    for (int i = 0; i <= LEVEL_MAX_PLAYERS; i++) starts[i] = 0;
     if (!level_cfg_loaded) return;
-
-    /* indexed 1..8: cell linear index + 1 (0 means slot empty) */
-    int starts[LEVEL_MAX_PLAYERS + 1] = {0};
     for (int r = 0; r < level_cfg.rows; r++) {
         for (int c = 0; c < level_cfg.cols; c++) {
             cell_t *cell = level_cell_at(&level_cfg, r, c);
@@ -556,34 +638,80 @@ static void assign_player_starts(void) {
             }
         }
     }
+}
 
-    int next_slot = 1;
+/* Pick the lowest player ID (1..LEVEL_MAX_PLAYERS) that is free among the
+ * currently connected clients. With a level loaded, restrict the choice
+ * to IDs that actually have a start cell on that map. Returns 0 if no
+ * slot is available — caller should refuse the connection. */
+static uint8_t pick_free_player_id(void) {
+    bool taken[LEVEL_MAX_PLAYERS + 2] = {false};
     for (int i = 0; i < active_clients_count; i++) {
-        while (next_slot <= LEVEL_MAX_PLAYERS && starts[next_slot] == 0) {
-            next_slot++;
-        }
-        if (next_slot > LEVEL_MAX_PLAYERS) {
-            log_msg("No start position for client %d", i + 1);
-            break;
-        }
-        int idx = starts[next_slot] - 1;
-        clients[i].p.id = (uint8_t)next_slot;
-        clients[i].p.row = (uint16_t)(idx / level_cfg.cols);
-        clients[i].p.col = (uint16_t)(idx % level_cfg.cols);
-        clients[i].p.alive = true;
-        clients[i].p.bomb_count       = 1;
-        clients[i].p.bomb_radius      =
-            level_cfg.radius ? level_cfg.radius : DEFAULT_BOMB_RADIUS;
-        clients[i].p.bomb_timer_ticks =
-            level_cfg.bomb_timer_ticks ? level_cfg.bomb_timer_ticks
-                                       : DEFAULT_BOMB_TIMER_TICKS;
-        clients[i].p.speed            =
-            level_cfg.speed ? level_cfg.speed : DEFAULT_PLAYER_SPEED;
-        log_msg("Player %d -> start %d at (%u,%u)",
-                i + 1, next_slot,
-                clients[i].p.row, clients[i].p.col);
-        next_slot++;
+        uint8_t id = clients[i].p.id;
+        if (id >= 1 && id <= LEVEL_MAX_PLAYERS) taken[id] = true;
     }
+    if (level_cfg_loaded) {
+        int starts[LEVEL_MAX_PLAYERS + 1];
+        compute_start_positions(starts);
+        for (uint8_t id = 1; id <= LEVEL_MAX_PLAYERS; id++) {
+            if (starts[id] && !taken[id]) return id;
+        }
+        return 0;
+    }
+    for (uint8_t id = 1; id <= LEVEL_MAX_PLAYERS; id++) {
+        if (!taken[id]) return id;
+    }
+    return 0;
+}
+
+static void apply_start_defaults(player_t *p, int idx) {
+    p->row = (uint16_t)(idx / level_cfg.cols);
+    p->col = (uint16_t)(idx % level_cfg.cols);
+    p->alive = true;
+    p->bomb_count       = 1;
+    p->bomb_radius      =
+        level_cfg.radius ? level_cfg.radius : DEFAULT_BOMB_RADIUS;
+    p->bomb_timer_ticks =
+        level_cfg.bomb_timer_ticks ? level_cfg.bomb_timer_ticks
+                                   : DEFAULT_BOMB_TIMER_TICKS;
+    p->speed            =
+        level_cfg.speed ? level_cfg.speed : DEFAULT_PLAYER_SPEED;
+    p->danger_extra_ticks = 0;
+}
+
+/* Place every existing client at the start cell that matches their
+ * already-assigned p.id. Used at game start, on level load, and on
+ * return-to-lobby. Never modifies p.id — IDs are stable for the life of
+ * the connection. */
+static void place_players_at_starts(void) {
+    if (!level_cfg_loaded) return;
+    int starts[LEVEL_MAX_PLAYERS + 1];
+    compute_start_positions(starts);
+    for (int i = 0; i < active_clients_count; i++) {
+        uint8_t id = clients[i].p.id;
+        if (id < 1 || id > LEVEL_MAX_PLAYERS) continue;
+        if (starts[id] == 0) {
+            log_msg("Player %u has no start on this map.", id);
+            continue;
+        }
+        apply_start_defaults(&clients[i].p, starts[id] - 1);
+        log_msg("Player %u -> start at (%u,%u)",
+                id, clients[i].p.row, clients[i].p.col);
+    }
+}
+
+/* Position one freshly-joined client at the start cell for their already
+ * picked p.id. */
+static void place_one_player_at_start(int client_idx) {
+    if (!level_cfg_loaded) return;
+    int starts[LEVEL_MAX_PLAYERS + 1];
+    compute_start_positions(starts);
+    uint8_t id = clients[client_idx].p.id;
+    if (id < 1 || id > LEVEL_MAX_PLAYERS) return;
+    if (starts[id] == 0) return;
+    apply_start_defaults(&clients[client_idx].p, starts[id] - 1);
+    log_msg("Player %u -> start at (%u,%u)",
+            id, clients[client_idx].p.row, clients[client_idx].p.col);
 }
 
 static void load_level_dialog(void) {
@@ -660,8 +788,9 @@ static void load_level_dialog(void) {
             entries[sel].name, level_cfg.rows, level_cfg.cols, starts,
             level_cfg.speed, level_cfg.danger_ticks, level_cfg.radius,
             level_cfg.bomb_timer_ticks);
-    assign_player_starts();
+    place_players_at_starts();
     broadcast_map();
+    check_match_start();
 }
 
 int init_ncurses() {
@@ -700,21 +829,23 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             memcpy(client_id, buffer + HEADER_LEN, CLIENT_ID_LEN);
             memcpy(player_name, buffer + HEADER_LEN + CLIENT_ID_LEN, PLAYER_NAME_LEN);
 
-            if (level_cfg_loaded) {
-                int cap = count_player_starts(&level_cfg);
-                if (active_clients_count > cap) {
-                    send_error(client_fd, ID_UNKNOWN, "Server full for this map");
-                    return -1;
-                }
+            /* Pick the lowest free player ID (and one that has a start
+             * cell on the loaded map, if any). This gives reconnecting /
+             * post-match joiners the first vacated slot rather than
+             * piling up at active_clients_count + 1. IDs are stable for
+             * the life of the connection — never reshuffled. */
+            uint8_t pid = pick_free_player_id();
+            if (pid == 0) {
+                send_error(client_fd, ID_UNKNOWN, "Server full for this map");
+                send_disconnect(client_fd, ID_UNKNOWN);
+                return -1;
             }
             snprintf(clients[client_idx].p.name, MAX_NAME_LEN + 1, "%s", player_name);
-            clients[client_idx].p.id = (uint8_t)(client_idx + 1);
+            clients[client_idx].p.id = pid;
             clients[client_idx].p.alive = true;
 
-            log_msg("C%d -> HELLO (id=%s, name=%s)",
-                    cn, client_id, clients[client_idx].p.name);
-
-            uint8_t pid = clients[client_idx].p.id;
+            log_msg("C%d -> HELLO (id=%s, name=%s) -> player %u",
+                    cn, client_id, clients[client_idx].p.name, pid);
 
             /* Forward HELLO to other clients so they learn about the new
              * player (per the protocol's "pārsūtāma" property). */
@@ -735,11 +866,21 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             }
 
             if (level_cfg_loaded) {
-                assign_player_starts();
+                place_one_player_at_start(client_idx);
                 if (send_map_to(client_fd, pid) == 0) {
                     log_msg("C%d <- MAP (%ux%u)", cn,
                             level_cfg.rows, level_cfg.cols);
                 }
+            }
+            /* If the client joined mid-match, hand it everyone's
+             * current state so its rendered board matches the server,
+             * and broadcast its own stats so existing clients render the
+             * fresh occupant of this (possibly-reused) player ID. */
+            if (current_game_state == GAME_RUNNING && level_cfg_loaded) {
+                broadcast_sync_board_for(&clients[client_idx].p);
+                send_sync_board_all_to(client_fd, pid);
+                log_msg("C%d <- SYNC_BOARD x%d (mid-match join)",
+                        cn, active_clients_count);
             }
             return 0;
         }
@@ -748,6 +889,12 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             log_msg("C%d -> PING", cn);
             send_simple(client_fd, MSG_PONG, clients[client_idx].p.id);
             log_msg("C%d <- PONG", cn);
+            return 0;
+        }
+
+        case MSG_PONG: {
+            /* Heartbeat reply — last_recv_at already refreshed by the
+             * read path; nothing else to do. */
             return 0;
         }
 
@@ -851,6 +998,8 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
                 target->player_id = 0;
                 apply_bonus(&clients[client_idx].p, kind);
                 broadcast_bonus_retrieved(clients[client_idx].p.id, coord);
+                /* Stats changed — refresh clients so HUDs stay accurate. */
+                broadcast_sync_board_for(&clients[client_idx].p);
                 log_msg("C%d picked up bonus at (%d,%d) (%s)",
                         cn, nr, nc,
                         kind == CELL_BONUS_SPEED  ? "speed"  :
@@ -894,6 +1043,11 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             bombs[slot].col           = p->col;
             bombs[slot].radius        = p->bomb_radius;
             bombs[slot].timer_ticks   = p->bomb_timer_ticks;
+            uint16_t base_danger = level_cfg.danger_ticks
+                                   ? level_cfg.danger_ticks
+                                   : DEFAULT_DANGER_TICKS;
+            bombs[slot].danger_ticks  =
+                (uint16_t)(base_danger + p->danger_extra_ticks);
 
             cell_t *cell = level_cell_at(&level_cfg, p->row, p->col);
             cell->type = CELL_BOMB;
@@ -909,7 +1063,9 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             log_msg("C%d -> SYNC_REQUEST", cn);
             if (current_game_state == GAME_RUNNING && level_cfg_loaded) {
                 send_map_to(client_fd, clients[client_idx].p.id);
-                log_msg("C%d <- MAP (sync)", cn);
+                send_sync_board_all_to(client_fd, clients[client_idx].p.id);
+                log_msg("C%d <- MAP + SYNC_BOARD x%d (sync)",
+                        cn, active_clients_count);
             }
             return 0;
         }
@@ -1120,10 +1276,13 @@ int main(int argc, char *argv[]) {
                 if (active_clients_count < cap) {
                     reset_client_data(active_clients_count);
                     clients[active_clients_count].fd = new_sock;
+                    clients[active_clients_count].last_recv_at = time(NULL);
+                    clients[active_clients_count].pong_pending_since = 0;
                     active_clients_count++;
                     log_msg("Client %d connected (awaiting HELLO).",
                             active_clients_count);
                 } else {
+                    send_disconnect(new_sock, ID_UNKNOWN);
                     close(new_sock);
                     log_msg("Connection refused: %s",
                             level_cfg_loaded ? "map is full" : "server full");
@@ -1141,6 +1300,8 @@ int main(int argc, char *argv[]) {
                 ssize_t bytes_read = read(sock, buffer, sizeof(buffer) - 1);
                 
                 if (bytes_read > 0) {
+                    clients[i].last_recv_at = time(NULL);
+                    clients[i].pong_pending_since = 0;
                     process_message(i, sock, buffer, bytes_read);
                 } else if (bytes_read == 0) {
                     log_msg("Client %d disconnected.", i + 1);
@@ -1191,6 +1352,32 @@ int main(int argc, char *argv[]) {
             }
         }
         active_clients_count = new_active;
+
+        /* Liveness sweep per protokols.docx: send PING after IDLE seconds
+         * of silence; only declare timeout if no reply (or any other
+         * traffic) arrives within PONG_TIMEOUT_SEC of that PING. */
+        time_t now_t = time(NULL);
+        for (int i = 0; i < active_clients_count; i++) {
+            if (clients[i].fd == -1) continue;
+            time_t silent = now_t - clients[i].last_recv_at;
+            if (clients[i].pong_pending_since != 0 &&
+                now_t - clients[i].pong_pending_since > PONG_TIMEOUT_SEC) {
+                log_msg("C%d PONG timeout (%lds since PING) - dropping.",
+                        i + 1,
+                        (long)(now_t - clients[i].pong_pending_since));
+                send_disconnect(clients[i].fd, clients[i].p.id);
+                if (clients[i].p.id != 0)
+                    broadcast_simple(MSG_LEAVE, clients[i].p.id);
+                close(clients[i].fd);
+                clients[i].fd = -1;
+            } else if (clients[i].pong_pending_since == 0 &&
+                       silent > IDLE_BEFORE_PING_SEC) {
+                if (send_simple(clients[i].fd, MSG_PING,
+                                clients[i].p.id) == 0) {
+                    clients[i].pong_pending_since = now_t;
+                }
+            }
+        }
 
         // If no activity, sleep briefly to reduce CPU usage
         if (ret == 0) {

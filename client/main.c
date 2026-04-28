@@ -15,7 +15,16 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <netdb.h>
+#include <time.h>
 #include <ncurses.h>
+
+#define WELCOME_TIMEOUT_SEC   30
+/* Per protokols.docx: send PING after IDLE_BEFORE_PING_SEC of silence,
+ * and only consider the peer timed out if no PONG (or any other reply)
+ * arrives within PONG_TIMEOUT_SEC of that PING. Silence alone is not a
+ * timeout — that was the old bug that dropped idle lobby clients. */
+#define IDLE_BEFORE_PING_SEC  15
+#define PONG_TIMEOUT_SEC      30
 
 #include "../common/level_config.h"
 #include "../common/protocol.h"
@@ -59,6 +68,11 @@ static volatile sig_atomic_t running = 1;
 static level_config_t level_cfg = {0};
 static bool level_cfg_loaded = false;
 static uint8_t my_player_id = ID_UNKNOWN;
+/* True only when we received a WINNER message in the current session for
+ * the current GAME_END. Used to suppress the end-of-match popup on a
+ * fresh reconnect into a stale GAME_END state — the rejoining player
+ * didn't participate, so we shouldn't claim anyone "won". */
+static bool    match_winner_observed = false;
 static bool me_ready = false;
 static game_status_t game_state = GAME_LOBBY;
 static uint8_t last_winner_id = ID_UNKNOWN;
@@ -68,6 +82,12 @@ typedef struct {
     bool     alive;
     uint16_t row;
     uint16_t col;
+    uint8_t  bomb_count;
+    uint8_t  bomb_radius;
+    uint16_t bomb_timer_ticks;
+    uint16_t speed;
+    uint16_t danger_extra_ticks;
+    uint8_t  lives;
 } client_player_t;
 
 static client_player_t players[MAX_PLAYERS + 1] = {0};
@@ -77,6 +97,7 @@ static void reset_session_state(void) {
     my_player_id = ID_UNKNOWN;
     game_state = GAME_LOBBY;
     level_cfg_loaded = false;
+    match_winner_observed = false;
     level_config_free(&level_cfg);
     memset(players, 0, sizeof(players));
 }
@@ -90,9 +111,18 @@ static const char *BANNER[] = {
 };
 #define BANNER_H ((int)(sizeof(BANNER) / sizeof(BANNER[0])))
 
+static int send_leave(int fd) {
+    msg_generic_t m = { MSG_LEAVE, my_player_id, ID_SERVER };
+    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
 static void cleanup(int sig) {
     (void)sig;
-    if (sock_fd != -1) close(sock_fd);
+    if (sock_fd != -1) {
+        send_leave(sock_fd);
+        close(sock_fd);
+        sock_fd = -1;
+    }
     level_config_free(&level_cfg);
     endwin();
     exit(0);
@@ -109,22 +139,24 @@ static void init_colors(void) {
     init_pair(PAIR_NORMAL,   COLOR_WHITE,  -1);
     init_pair(PAIR_STATUS,   COLOR_RED,    -1);
     init_pair(PAIR_INFO,     COLOR_CYAN,   -1);
-    init_pair(PAIR_HARD,     COLOR_WHITE,   COLOR_BLUE);
+    /* Hard walls own bg=blue. Players never use bg=blue so they stay
+     * visually distinct against walls. */
+    init_pair(PAIR_HARD,     COLOR_BLUE,    COLOR_BLUE);
     init_pair(PAIR_SOFT,     COLOR_BLACK,   COLOR_YELLOW);
-    init_pair(PAIR_FLOOR,    COLOR_GREEN,   COLOR_BLACK);
-    init_pair(PAIR_FLOOR2,   COLOR_YELLOW,  COLOR_BLACK);
-    init_pair(PAIR_BOMB,     COLOR_YELLOW,  COLOR_BLACK);
+    init_pair(PAIR_FLOOR,    COLOR_WHITE,   COLOR_BLACK);
+    init_pair(PAIR_FLOOR2,   COLOR_WHITE,   COLOR_BLACK);
+    init_pair(PAIR_BOMB,     COLOR_RED,     COLOR_BLACK);
     init_pair(PAIR_B_SPEED,  COLOR_BLACK,   COLOR_CYAN);
     init_pair(PAIR_B_RAD,    COLOR_WHITE,   COLOR_MAGENTA);
     init_pair(PAIR_B_TIMER,  COLOR_BLACK,   COLOR_WHITE);
     init_pair(PAIR_B_BOMBS,  COLOR_YELLOW,  COLOR_RED);
     init_pair(PAIR_PLAYER1,  COLOR_WHITE,   COLOR_RED);
-    init_pair(PAIR_PLAYER2,  COLOR_WHITE,   COLOR_BLUE);
-    init_pair(PAIR_PLAYER3,  COLOR_BLACK,   COLOR_GREEN);
+    init_pair(PAIR_PLAYER2,  COLOR_WHITE,   COLOR_GREEN);
+    init_pair(PAIR_PLAYER3,  COLOR_BLACK,   COLOR_CYAN);
     init_pair(PAIR_PLAYER4,  COLOR_BLACK,   COLOR_YELLOW);
     init_pair(PAIR_PLAYER5,  COLOR_WHITE,   COLOR_MAGENTA);
-    init_pair(PAIR_PLAYER6,  COLOR_BLACK,   COLOR_CYAN);
-    init_pair(PAIR_PLAYER7,  COLOR_WHITE,   COLOR_BLACK);
+    init_pair(PAIR_PLAYER6,  COLOR_YELLOW,  COLOR_RED);
+    init_pair(PAIR_PLAYER7,  COLOR_BLACK,   COLOR_GREEN);
     init_pair(PAIR_PLAYER8,  COLOR_BLACK,   COLOR_WHITE);
     init_pair(PAIR_EXPL,     COLOR_YELLOW,  COLOR_RED);
 }
@@ -216,6 +248,11 @@ static int send_hello(int fd, const char *player_name) {
 
 static int send_ping(int fd) {
     msg_generic_t m = { MSG_PING, ID_UNKNOWN, ID_SERVER };
+    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
+static int send_pong(int fd) {
+    msg_generic_t m = { MSG_PONG, my_player_id, ID_SERVER };
     return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
 }
 
@@ -426,37 +463,41 @@ static int player_pair(uint8_t pid) {
 }
 
 static void cell_glyphs(const cell_t *cell, int r, int c,
-                        int *pair, int *attr, char top[4], char bot[4]) {
+                        int *pair, int *attr,
+                        char top[CELL_W + 1], char bot[CELL_W + 1]) {
+    (void)r; (void)c;
     *attr = A_BOLD;
     switch (cell->type) {
-        case CELL_EMPTY: {
-            bool dark = ((r + c) & 1) == 0;
-            *pair = dark ? PAIR_FLOOR : PAIR_FLOOR2;
+        case CELL_EMPTY:
+            *pair = PAIR_FLOOR;
             *attr = A_DIM;
-            memcpy(top, " . ", 4);
+            memcpy(top, "   ", 4);
             memcpy(bot, "   ", 4);
             break;
-        }
         case CELL_HARD_BLOCK:
+            /* Solid block — fg=bg=blue plus spaces gives a clean wall. */
             *pair = PAIR_HARD;
-            memcpy(top, "###", 4);
-            memcpy(bot, "###", 4);
+            *attr = 0;
+            memcpy(top, "   ", 4);
+            memcpy(bot, "   ", 4);
             break;
         case CELL_SOFT_BLOCK:
             *pair = PAIR_SOFT;
-            memcpy(top, "+=+", 4);
-            memcpy(bot, "+=+", 4);
+            memcpy(top, "[#]", 4);
+            memcpy(bot, "[#]", 4);
             break;
         case CELL_BOMB:
             *pair = PAIR_BOMB;
-            memcpy(top, " * ", 4);
-            memcpy(bot, "* *", 4);
+            memcpy(top, " o ", 4);
+            memcpy(bot, "(_)", 4);
             break;
         case CELL_PLAYER_START: {
             *pair = player_pair(cell->player_id);
-            top[0] = '('; top[1] = (char)('0' + cell->player_id);
-            top[2] = ')'; top[3] = '\0';
-            memcpy(bot, "/_\\", 4);
+            top[0] = ' ';
+            top[1] = (char)('0' + cell->player_id);
+            top[2] = ' ';
+            top[3] = '\0';
+            memcpy(bot, "/V\\", 4);
             break;
         }
         case CELL_BONUS_SPEED:
@@ -467,7 +508,7 @@ static void cell_glyphs(const cell_t *cell, int r, int c,
         case CELL_BONUS_RADIUS:
             *pair = PAIR_B_RAD;
             memcpy(top, " R ", 4);
-            memcpy(bot, "<+>", 4);
+            memcpy(bot, "<*>", 4);
             break;
         case CELL_BONUS_TIMER:
             *pair = PAIR_B_TIMER;
@@ -477,19 +518,19 @@ static void cell_glyphs(const cell_t *cell, int r, int c,
         case CELL_BONUS_BOMBS:
             *pair = PAIR_B_BOMBS;
             memcpy(top, " N ", 4);
-            memcpy(bot, " * ", 4);
+            memcpy(bot, "+*+", 4);
             break;
         case CELL_EXPLOSION:
             *pair = PAIR_EXPL;
-            memcpy(top, "***", 4);
-            memcpy(bot, "***", 4);
+            memcpy(top, "\\|/", 4);
+            memcpy(bot, "/|\\", 4);
             break;
     }
 }
 
 static void draw_cell(int y, int x, const cell_t *cell, int r, int c) {
     int pair = PAIR_FLOOR, attr = 0;
-    char top[4] = "   ", bot[4] = "   ";
+    char top[CELL_W + 1] = "   ", bot[CELL_W + 1] = "   ";
     cell_glyphs(cell, r, c, &pair, &attr, top, bot);
     attron(COLOR_PAIR(pair) | attr);
     mvaddstr(y,     x, top);
@@ -499,15 +540,16 @@ static void draw_cell(int y, int x, const cell_t *cell, int r, int c) {
 
 static void draw_legend(int y, int x) {
     struct { int pair; const char *t; const char *b; const char *label; } items[] = {
-        { PAIR_HARD,    "###", "###", "Hard wall"     },
-        { PAIR_SOFT,    "+=+", "+=+", "Soft block"    },
-        { PAIR_FLOOR,   " . ", "   ", "Floor"         },
-        { PAIR_PLAYER1, "(1)", "/_\\", "Player start" },
-        { PAIR_BOMB,    " * ", "* *", "Bomb"          },
+        { PAIR_HARD,    "   ", "   ", "Hard wall"     },
+        { PAIR_SOFT,    "[#]", "[#]", "Soft block"    },
+        { PAIR_FLOOR,   "   ", "   ", "Floor"         },
+        { PAIR_PLAYER1, " 1 ", "/V\\", "Player start" },
+        { PAIR_BOMB,    " o ", "(_)", "Bomb"          },
+        { PAIR_EXPL,    "\\|/", "/|\\", "Explosion"   },
         { PAIR_B_SPEED, " A ", ">>>", "Speed +1"      },
-        { PAIR_B_RAD,   " R ", "<+>", "Radius +1"     },
+        { PAIR_B_RAD,   " R ", "<*>", "Radius +1"     },
         { PAIR_B_TIMER, " T ", "(C)", "Timer +10t"    },
-        { PAIR_B_BOMBS, " N ", " * ", "Bombs +1"      },
+        { PAIR_B_BOMBS, " N ", "+*+", "Bombs +1"      },
     };
     int n = (int)(sizeof(items) / sizeof(items[0]));
     attron(COLOR_PAIR(PAIR_NORMAL) | A_BOLD);
@@ -850,6 +892,30 @@ static void draw_ui(const char *host, int port, const char *player_name,
              game_state == GAME_END     ? "ENDED"   : "LOBBY");
     attroff(COLOR_PAIR(PAIR_NORMAL));
 
+    if ((game_state == GAME_RUNNING || game_state == GAME_END) &&
+        my_player_id >= 1 && my_player_id <= MAX_PLAYERS &&
+        players[my_player_id].active) {
+        const client_player_t *me = &players[my_player_id];
+        int pcolor = player_pair(my_player_id);
+        attron(COLOR_PAIR(pcolor) | A_BOLD);
+        mvprintw(y++, x, " YOU: P%u (%s) ",
+                 my_player_id,
+                 me->alive ? "alive" : "dead - spectating");
+        attroff(COLOR_PAIR(pcolor) | A_BOLD);
+        attron(COLOR_PAIR(PAIR_INFO));
+        mvprintw(y++, x + 2,
+                 "bombs  : %u",   me->bomb_count);
+        mvprintw(y++, x + 2,
+                 "radius : %u",   me->bomb_radius);
+        mvprintw(y++, x + 2,
+                 "speed  : %u",   me->speed);
+        mvprintw(y++, x + 2,
+                 "fuse   : %ut",  me->bomb_timer_ticks);
+        mvprintw(y++, x + 2,
+                 "linger : +%ut", me->danger_extra_ticks);
+        attroff(COLOR_PAIR(PAIR_INFO));
+    }
+
     if (game_state == GAME_RUNNING && level_cfg_loaded) {
         int map_x = 38;
         int map_y = 3;
@@ -897,7 +963,7 @@ static void draw_ui(const char *host, int port, const char *player_name,
         }
     }
 
-    if (game_state == GAME_END) {
+    if (game_state == GAME_END && match_winner_observed) {
         int rows2, cols2;
         getmaxyx(stdscr, rows2, cols2);
         int by = rows2 / 2 - 3;
@@ -1041,6 +1107,9 @@ int main(int argc, char *argv[]) {
                 sock_fd = -1;
             } else {
                 joined = true;
+                snprintf(menu_status, sizeof(menu_status),
+                         "Connected. Waiting for WELCOME...");
+                menu_status_pair = PAIR_INFO;
             }
         } else if (activate_idx == 1) {
             sel = 1;
@@ -1062,11 +1131,20 @@ int main(int argc, char *argv[]) {
     char last_recv[BUFFER_SIZE] = "(none)";
     char status[64] = "connected";
     bool disconnected = false;
+    bool welcome_received = false;
+    time_t hello_sent_at  = time(NULL);
+    time_t last_recv_at   = hello_sent_at;
+    /* When non-zero, time we sent a PING that hasn't been answered by any
+     * incoming traffic yet. Cleared on every read; checked against
+     * PONG_TIMEOUT_SEC to declare a peer timeout per protokols.docx. */
+    time_t pong_pending_since = 0;
 
     while (running && !disconnected) {
         uint8_t buf[BUFFER_SIZE];
         ssize_t n = poll_recv(sock_fd, (char *)buf, sizeof(buf));
         if (n > 0) {
+            last_recv_at = time(NULL);
+            pong_pending_since = 0;
             size_t off = 0;
             while ((size_t)n - off >= sizeof(msg_generic_t)) {
                 size_t avail = (size_t)n - off;
@@ -1086,6 +1164,9 @@ int main(int argc, char *argv[]) {
                         memcpy(sid, w->server_id, SERVER_ID_LEN);
                         my_player_id = hdr->sender_id;
                         game_state = (game_status_t)w->game_status;
+                        /* New session: forget any winner from a prior
+                         * match the server may still be parked in. */
+                        match_winner_observed = false;
                         memset(players, 0, sizeof(players));
                         if (my_player_id >= 1 &&
                             my_player_id <= MAX_PLAYERS) {
@@ -1106,6 +1187,7 @@ int main(int argc, char *argv[]) {
                                  "WELCOME id=%u status=%u others=%u srv=%s",
                                  my_player_id, w->game_status,
                                  w->length, sid);
+                        welcome_received = true;
                         consumed = total;
                         break;
                     }
@@ -1113,6 +1195,11 @@ int main(int argc, char *argv[]) {
                         if (avail < sizeof(msg_hello_t)) goto stop;
                         uint8_t id = hdr->sender_id;
                         if (id >= 1 && id <= MAX_PLAYERS) {
+                            /* HELLO may be for a freshly reused ID — wipe
+                             * the previous occupant's cached stats so we
+                             * don't render stale loadout/position until
+                             * the next SYNC_BOARD arrives. */
+                            memset(&players[id], 0, sizeof(players[id]));
                             players[id].active = true;
                             players[id].alive  = true;
                         }
@@ -1130,6 +1217,7 @@ int main(int argc, char *argv[]) {
                                  "SET_STATUS = %u", s->game_status);
                         if (game_state == GAME_RUNNING) {
                             last_winner_id = ID_UNKNOWN;
+                            match_winner_observed = false;
                             for (int k = 1; k <= MAX_PLAYERS; k++) {
                                 if (players[k].active)
                                     players[k].alive = true;
@@ -1139,6 +1227,7 @@ int main(int argc, char *argv[]) {
                         } else if (game_state == GAME_LOBBY) {
                             me_ready = false;
                             last_winner_id = ID_UNKNOWN;
+                            match_winner_observed = false;
                             for (int k = 1; k <= MAX_PLAYERS; k++) {
                                 if (players[k].active)
                                     players[k].alive = true;
@@ -1156,6 +1245,12 @@ int main(int argc, char *argv[]) {
                         snprintf(last_recv, sizeof(last_recv),
                                  "SET_READY id=%u", hdr->sender_id);
                         if (hdr->sender_id == my_player_id) me_ready = true;
+                        consumed = sizeof(msg_generic_t);
+                        break;
+                    case MSG_PING:
+                        send_pong(sock_fd);
+                        snprintf(last_recv, sizeof(last_recv),
+                                 "PING from server -> PONG");
                         consumed = sizeof(msg_generic_t);
                         break;
                     case MSG_PONG:
@@ -1298,6 +1393,7 @@ int main(int argc, char *argv[]) {
                         const msg_winner_t *w =
                             (const msg_winner_t *)(buf + off);
                         last_winner_id = w->winner_id;
+                        match_winner_observed = true;
                         snprintf(last_recv, sizeof(last_recv),
                                  "WINNER id=%u", w->winner_id);
                         if (w->winner_id == ID_UNKNOWN) {
@@ -1452,6 +1548,32 @@ int main(int argc, char *argv[]) {
                         consumed = sizeof(msg_bonus_available_t);
                         break;
                     }
+                    case MSG_SYNC_BOARD: {
+                        if (avail < sizeof(msg_sync_board_t)) goto stop;
+                        const msg_sync_board_t *sb =
+                            (const msg_sync_board_t *)(buf + off);
+                        uint8_t pid = sb->player_id;
+                        if (pid >= 1 && pid <= MAX_PLAYERS) {
+                            players[pid].active             = true;
+                            players[pid].alive              = sb->alive ? true : false;
+                            players[pid].lives              = sb->lives;
+                            players[pid].row                = ntohs(sb->row);
+                            players[pid].col                = ntohs(sb->col);
+                            players[pid].bomb_count         = sb->bomb_count;
+                            players[pid].bomb_radius        = sb->bomb_radius;
+                            players[pid].bomb_timer_ticks   = ntohs(sb->bomb_timer_ticks);
+                            players[pid].speed              = ntohs(sb->speed);
+                            players[pid].danger_extra_ticks = ntohs(sb->danger_extra_ticks);
+                        }
+                        snprintf(last_recv, sizeof(last_recv),
+                                 "SYNC_BOARD id=%u @(%u,%u) %s lives=%u",
+                                 pid,
+                                 players[pid].row, players[pid].col,
+                                 sb->alive ? "alive" : "dead",
+                                 sb->lives);
+                        consumed = sizeof(msg_sync_board_t);
+                        break;
+                    }
                     case MSG_BONUS_RETRIEVED: {
                         if (avail < sizeof(msg_bonus_retrieved_t)) goto stop;
                         const msg_bonus_retrieved_t *br =
@@ -1491,6 +1613,30 @@ int main(int argc, char *argv[]) {
             snprintf(status, sizeof(status), "recv error: %s", strerror(errno));
         }
 
+        if (!disconnected) {
+            time_t now = time(NULL);
+            if (!welcome_received &&
+                now - hello_sent_at > WELCOME_TIMEOUT_SEC) {
+                disconnected = true;
+                snprintf(status, sizeof(status),
+                         "no WELCOME within %ds - giving up",
+                         WELCOME_TIMEOUT_SEC);
+            } else if (welcome_received) {
+                if (pong_pending_since != 0 &&
+                    now - pong_pending_since > PONG_TIMEOUT_SEC) {
+                    disconnected = true;
+                    snprintf(status, sizeof(status),
+                             "no PONG within %ds - peer timeout",
+                             PONG_TIMEOUT_SEC);
+                } else if (pong_pending_since == 0 &&
+                           now - last_recv_at > IDLE_BEFORE_PING_SEC) {
+                    if (send_ping(sock_fd) == 0) {
+                        pong_pending_since = now;
+                    }
+                }
+            }
+        }
+
         draw_ui(host, port, player_name, last_recv, status);
 
         int ch = getch();
@@ -1498,6 +1644,8 @@ int main(int argc, char *argv[]) {
             cleanup(0);
         } else if (ch == 'p' || ch == 'P') {
             if (send_ping(sock_fd) == 0) {
+                if (pong_pending_since == 0)
+                    pong_pending_since = time(NULL);
                 snprintf(status, sizeof(status), "PING sent");
             } else {
                 snprintf(status, sizeof(status),
@@ -1575,6 +1723,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (sock_fd != -1) {
+        /* Voluntary close — let the server know we're going. */
+        send_leave(sock_fd);
         close(sock_fd);
         sock_fd = -1;
     }

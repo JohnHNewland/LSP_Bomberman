@@ -55,6 +55,10 @@ typedef enum {
     MSG_EXPLOSION_START  = 42,
     MSG_EXPLOSION_END    = 43,
     MSG_DEATH            = 44,
+    /* Reserved for hidden-bonus reveals. Bonuses are currently placed at
+     * map-load time and are visible to all clients via MSG_MAP, so the
+     * server never emits this. The client has a handler ready for when
+     * hidden bonuses ship. */
     MSG_BONUS_AVAILABLE  = 45,
     MSG_BONUS_RETRIEVED  = 46,
     MSG_BLOCK_DESTROYED  = 47,
@@ -62,7 +66,7 @@ typedef enum {
     MSG_SYNC_REQUEST     = 101
 } msg_type_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     uint8_t msg_type;
     uint8_t sender_id;
     uint8_t target_id;
@@ -70,90 +74,104 @@ typedef struct __attribute__((packed)) {
 
 #define HEADER_LEN ((int)sizeof(msg_generic_t))
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     char          client_id[CLIENT_ID_LEN];
     char          player_name[PLAYER_NAME_LEN];
 } msg_hello_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     char          server_id[SERVER_ID_LEN];
     uint8_t       game_status;
     uint8_t       length;
 } msg_welcome_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     uint8_t id;
     uint8_t ready;
     char    name[PLAYER_NAME_LEN];
 } msg_other_client_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       H;
     uint8_t       W;
 } msg_map_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       game_status;
 } msg_set_status_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       winner_id;
 } msg_winner_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       direction;
 } msg_move_attempt_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       player_id;
     uint16_t      coord;
 } msg_moved_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint16_t      cell;
 } msg_bomb_attempt_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       player_id;
     uint16_t      cell;
 } msg_bomb_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       radius;
     uint16_t      cell;
 } msg_explosion_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       player_id;
 } msg_death_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       bonus_type;
     uint16_t      cell;
 } msg_bonus_available_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint8_t       player_id;
     uint16_t      cell;
 } msg_bonus_retrieved_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     msg_generic_t hdr;
     uint16_t      cell;
 } msg_block_destroyed_t;
+
+typedef struct {
+    msg_generic_t hdr;
+    uint8_t  player_id;
+    uint8_t  alive;
+    uint8_t  lives;
+    uint16_t row;
+    uint16_t col;
+    uint8_t  bomb_count;
+    uint8_t  bomb_radius;
+    uint16_t bomb_timer_ticks;
+    uint16_t speed;
+    uint16_t danger_extra_ticks;
+} msg_sync_board_t;
 
 typedef struct {
     uint8_t  id;
@@ -167,6 +185,9 @@ typedef struct {
     uint8_t  bomb_radius;
     uint16_t bomb_timer_ticks;
     uint16_t speed;
+    /* Extra explosion-lingering ticks granted by BONUS_TIMER pickups.
+     * Added to the level's danger_ticks when this player's bomb detonates. */
+    uint16_t danger_extra_ticks;
 } player_t;
 
 typedef struct {
