@@ -44,7 +44,6 @@ static client_t clients[MAX_CLIENTS];
 static int active_clients_count = 0;
 static volatile sig_atomic_t running = 1;
 static game_status_t current_game_state = GAME_LOBBY;
-static uint8_t last_winner_id = ID_UNKNOWN;
 
 static level_config_t level_cfg = {0};
 static level_config_t level_cfg_pristine = {0};
@@ -487,7 +486,6 @@ static void end_game(uint8_t winner_id) {
     if (current_game_state == GAME_END) 
         return;
     current_game_state = GAME_END;
-    last_winner_id = winner_id;
     for (int i = 0; i < MAX_BOMBS; i++) bombs[i].active = false;
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
     broadcast_set_status(GAME_END);
@@ -516,7 +514,6 @@ static void check_game_end(void) {
 static void reset_server_to_empty(void) {
     log_msg("Server empty - resetting room (no map, lobby).");
     current_game_state = GAME_LOBBY;
-    last_winner_id = ID_UNKNOWN;
     for (int i = 0; i < MAX_BOMBS; i++) bombs[i].active = false;
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
     if (level_cfg_loaded) {
@@ -529,7 +526,6 @@ static void reset_server_to_empty(void) {
 static void return_to_lobby(void) {
     if (current_game_state == GAME_LOBBY) return;
     current_game_state = GAME_LOBBY;
-    last_winner_id = ID_UNKNOWN;
     for (int i = 0; i < MAX_BOMBS; i++) bombs[i].active = false;
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
     for (int i = 0; i < active_clients_count; i++) {
@@ -862,7 +858,6 @@ static void load_level_dialog(void) {
     }
 }
 
-/* Lobby leader = player with the lowest active id. Empty room → 0. */
 static uint8_t lobby_leader_id(void) {
     uint8_t lead = 0;
     for (int i = 0; i < active_clients_count; i++) {
@@ -893,14 +888,6 @@ void reset_client_data(int index) {
     memset(&clients[index].p, 0, sizeof(player_t));
 }
 
-/* Wire-byte length of a message of the given type, given the bytes we
- * have buffered so far (avail). Returns:
- *   > 0 - the full length of the message; caller should slice that many
- *         bytes off buffer and dispatch them.
- *     0 - not enough buffered yet to know (e.g. variable-length header);
- *         caller should wait for more bytes.
- *    -1 - unknown / illegal type.
- */
 static ssize_t msg_wire_len(uint8_t type, const char *buf, ssize_t avail) {
     switch (type) {
         case MSG_HELLO:            return (ssize_t)sizeof(msg_hello_t);

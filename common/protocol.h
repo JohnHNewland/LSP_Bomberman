@@ -36,9 +36,6 @@ typedef enum {
     BONUS_SPEED  = 1,
     BONUS_RADIUS = 2,
     BONUS_TIMER  = 3,
-    /* Extends the spec's bonus enum: the spec body lists "+1 bomb" as a valid
-     * bonus and the map syntax uses 'N' for it, but the spec's typedef forgot
-     * to enumerate it. Wire byte for the type field is 4. */
     BONUS_BOMBS  = 4
 } bonus_type_t;
 
@@ -52,10 +49,6 @@ typedef enum {
     MSG_ERROR            = 6,
     MSG_MAP              = 7,
     MSG_SET_READY        = 10,
-    /* Spec only defines SET_READY; this extension lets a player toggle
-     * back to "not ready" while still in the lobby. ID 11 sits next to
-     * SET_READY and outside the rest of the spec's lobby-numbered
-     * range so future spec types can't collide. */
     MSG_SET_NOT_READY    = 11,
     MSG_SET_STATUS       = 20,
     MSG_WINNER           = 23,
@@ -66,19 +59,11 @@ typedef enum {
     MSG_EXPLOSION_START  = 42,
     MSG_EXPLOSION_END    = 43,
     MSG_DEATH            = 44,
-    /* Reserved for hidden-bonus reveals. Bonuses are currently placed at
-     * map-load time and are visible to all clients via MSG_MAP, so the
-     * server never emits this. The client has a handler ready for when
-     * hidden bonuses ship. */
     MSG_BONUS_AVAILABLE  = 45,
     MSG_BONUS_RETRIEVED  = 46,
     MSG_BLOCK_DESTROYED  = 47,
     MSG_SYNC_BOARD       = 100,
     MSG_SYNC_REQUEST     = 101,
-    /* Lobby-only, leader-only map picker. Not in protokols.docx (the spec
-     * mandates leader-driven map selection but leaves the wire format
-     * open). Uses IDs above the spec's range so it doesn't collide with
-     * future spec additions. */
     MSG_MAP_LIST_REQUEST = 110,
     MSG_MAP_LIST         = 111,
     MSG_MAP_SELECT       = 112
@@ -193,11 +178,6 @@ typedef struct {
 
 #define MAP_NAME_LEN 64
 
-/* One entry per available map in the server's maps/ folder. Per spec
- * (protokols.docx, "Serveris nodod klientam... laukuma izmērs,
- * spēlētāju skaits, laukuma izkārtojums"): size and player count are
- * included here so the leader can pick informed; the layout itself
- * arrives in MAP after the leader sends MAP_SELECT. */
 typedef struct {
     char     name[MAP_NAME_LEN];
     uint8_t  rows;
@@ -208,7 +188,6 @@ typedef struct {
 typedef struct {
     msg_generic_t hdr;
     uint8_t       count;
-    /* Followed by count * msg_map_entry_t. */
 } msg_map_list_t;
 
 typedef struct {
@@ -228,8 +207,6 @@ typedef struct {
     uint8_t  bomb_radius;
     uint16_t bomb_timer_ticks;
     uint16_t speed;
-    /* Extra explosion-lingering ticks granted by BONUS_TIMER pickups.
-     * Added to the level's danger_ticks when this player's bomb detonates. */
     uint16_t danger_extra_ticks;
 } player_t;
 

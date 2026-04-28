@@ -31,6 +31,8 @@
 #define CLIENT_ID_STR "bbm-client-1.0"
 #define DEFAULT_PLAYER_NAME "Player"
 
+#define DEFAULT_BOMB_TIMER_TICKS 60
+
 #define PAIR_TITLE    1
 #define PAIR_BORDER   2
 #define PAIR_HOTKEY   3
@@ -102,6 +104,61 @@ static int  map_picker_sel   = 0;
 static bool map_picker_open  = false;
 static bool map_list_pending = false;
 
+#define CLIENT_MAX_BOMBS 64
+typedef struct {
+    bool     active;
+    uint16_t row;
+    uint16_t col;
+    uint16_t total_ticks;
+    time_t   placed_at;
+} client_bomb_t;
+static client_bomb_t client_bombs[CLIENT_MAX_BOMBS];
+
+static void client_bombs_clear(void) {
+    memset(client_bombs, 0, sizeof(client_bombs));
+}
+
+static void client_bomb_add(uint16_t r, uint16_t c, uint16_t total_ticks) {
+    for (int i = 0; i < CLIENT_MAX_BOMBS; i++) {
+        if (client_bombs[i].active && client_bombs[i].row == r && client_bombs[i].col == c) {
+            client_bombs[i].total_ticks = total_ticks;
+            client_bombs[i].placed_at   = time(NULL);
+            return;
+        }
+    }
+    for (int i = 0; i < CLIENT_MAX_BOMBS; i++) {
+        if (!client_bombs[i].active) {
+            client_bombs[i].active      = true;
+            client_bombs[i].row         = r;
+            client_bombs[i].col         = c;
+            client_bombs[i].total_ticks = total_ticks;
+            client_bombs[i].placed_at   = time(NULL);
+            return;
+        }
+    }
+}
+
+static void client_bomb_remove_at(uint16_t r, uint16_t c) {
+    for (int i = 0; i < CLIENT_MAX_BOMBS; i++) {
+        if (client_bombs[i].active && client_bombs[i].row == r && client_bombs[i].col == c) {
+            client_bombs[i].active = false;
+        }
+    }
+}
+
+static int client_bomb_seconds_left(uint16_t r, uint16_t c) {
+    for (int i = 0; i < CLIENT_MAX_BOMBS; i++) {
+        if (!client_bombs[i].active) continue;
+        if (client_bombs[i].row != r || client_bombs[i].col != c) continue;
+        long total_secs = (long)client_bombs[i].total_ticks / TICKS_PER_SECOND;
+        long elapsed    = (long)(time(NULL) - client_bombs[i].placed_at);
+        long left       = total_secs - elapsed;
+        if (left < 0) left = 0;
+        return (int)left;
+    }
+    return -1;
+}
+
 static void notif_push(const char *fmt, ...) {
     int slot = notif_count % NOTIF_MAX;
     va_list ap;
@@ -137,6 +194,7 @@ static void reset_session_state(void) {
     map_picker_open  = false;
     map_picker_count = 0;
     map_list_pending = false;
+    client_bombs_clear();
 }
 
 static const char *BANNER[] = {
@@ -576,8 +634,7 @@ static int player_pair(uint8_t pid) {
     }
 }
 
-static void cell_glyphs(const cell_t *cell, int r, int c, int *pair, int *attr, int cell_h, int cell_w, char rows[][MAX_CELL_W + 1]) {
-    (void)r; (void)c;
+static void cell_glyphs(const cell_t *cell, int bomb_secs_left, int *pair, int *attr, int cell_h, int cell_w, char rows[][MAX_CELL_W + 1]) {
     *pair = PAIR_FLOOR;
     *attr = 0;
     for (int i = 0; i < cell_h; i++) {
@@ -600,7 +657,13 @@ static void cell_glyphs(const cell_t *cell, int r, int c, int *pair, int *attr, 
         case CELL_BOMB:
             *pair = PAIR_BOMB;
             *attr = A_BOLD;
-            glyph = 'o';
+            if (bomb_secs_left >= 0 && bomb_secs_left <= 9) {
+                glyph = (char)('0' + bomb_secs_left);
+            } else if (bomb_secs_left > 9) {
+                glyph = '*';
+            } else {
+                glyph = 'o';
+            }
             break;
         case CELL_EXPLOSION:
             *pair = PAIR_EXPL;
@@ -639,7 +702,11 @@ static void cell_glyphs(const cell_t *cell, int r, int c, int *pair, int *attr, 
 static void draw_cell(int y, int x, const cell_t *cell, int r, int c, int cell_h, int cell_w) {
     int pair = PAIR_FLOOR, attr = 0;
     char rows[MAX_CELL_H][MAX_CELL_W + 1];
-    cell_glyphs(cell, r, c, &pair, &attr, cell_h, cell_w, rows);
+    int bomb_secs_left = -1;
+    if (cell->type == CELL_BOMB) {
+        bomb_secs_left = client_bomb_seconds_left((uint16_t)r, (uint16_t)c);
+    }
+    cell_glyphs(cell, bomb_secs_left, &pair, &attr, cell_h, cell_w, rows);
     attron(COLOR_PAIR(pair) | attr);
     for (int i = 0; i < cell_h; i++) {
         mvaddstr(y + i, x, rows[i]);
@@ -769,16 +836,16 @@ static void draw_map_picker(void) {
 
 static void draw_legend(int y, int x) {
     struct { int pair; const char *t; const char *b; const char *label; } items[] = {
-        { PAIR_HARD,    "   ", "   ", "Hard wall"     },
-        { PAIR_SOFT,    "[#]", "[#]", "Soft block"    },
-        { PAIR_FLOOR,   "   ", "   ", "Floor"         },
-        { PAIR_PLAYER1, " 1 ", "/V\\", "Player start" },
-        { PAIR_BOMB,    " o ", "(_)", "Bomb"          },
-        { PAIR_EXPL,    "\\|/", "/|\\", "Explosion"   },
-        { PAIR_B_SPEED, " A ", ">>>", "Speed +1"      },
-        { PAIR_B_RAD,   " R ", "<*>", "Radius +1"     },
-        { PAIR_B_TIMER, " T ", "(C)", "Timer +10t"    },
-        { PAIR_B_BOMBS, " N ", "+*+", "Bombs +1"      },
+        { PAIR_HARD,    "   ", "   ", "Hard wall"               },
+        { PAIR_SOFT,    "[#]", "[#]", "Soft block"              },
+        { PAIR_FLOOR,   "   ", "   ", "Floor"                   },
+        { PAIR_PLAYER1, " 1 ", "/V\\", "Player start"           },
+        { PAIR_BOMB,    " o ", "(_)", "Bomb"                    },
+        { PAIR_EXPL,    "\\|/", "/|\\", "Explosion"             },
+        { PAIR_B_SPEED, " A ", ">>>", "Speed +1"                },
+        { PAIR_B_RAD,   " R ", "<*>", "Radius +1"               },
+        { PAIR_B_TIMER, " T ", "(C)", "Danger timer +10 ticks"  },
+        { PAIR_B_BOMBS, " N ", "+*+", "Bombs +1"                },
     };
     int n = (int)(sizeof(items) / sizeof(items[0]));
     attron(COLOR_PAIR(PAIR_NORMAL) | A_BOLD);
@@ -1266,12 +1333,16 @@ int main(int argc, char *argv[]) {
                     snprintf(menu_status, sizeof(menu_status), "Connected. Waiting for WELCOME...");
                     menu_status_pair = PAIR_INFO;
                 }
-            } else if (activate_idx == 1) {
+            }
+            // Editing server address
+            else if (activate_idx == 1) {
                 sel = 1;
                 edit_server(host, sizeof(host), &port);
+            // Editing player name
             } else if (activate_idx == 2) {
                 sel = 2;
                 edit_name(player_name, sizeof(player_name));
+            // Quitting
             } else if (activate_idx == 3) {
                 cleanup(0);
             }
@@ -1288,6 +1359,7 @@ int main(int argc, char *argv[]) {
         time_t last_recv_at   = hello_sent_at;
 
         time_t pong_pending_since = 0;
+        time_t status_expire_at   = 0;
 
         // Actions while connected to the server
         while (!disconnected) {
@@ -1368,6 +1440,7 @@ int main(int argc, char *argv[]) {
                                 last_winner_id = ID_UNKNOWN;
                                 match_winner_observed = false;
                                 notif_clear();
+                                client_bombs_clear();
                                 for (int k = 1; k <= MAX_PLAYERS; k++) {
                                     if (players[k].active) {
                                         players[k].alive = true;
@@ -1375,11 +1448,13 @@ int main(int argc, char *argv[]) {
                                     }
                                 }
                                 snprintf(status, sizeof(status), "Match started!");
+                                status_expire_at = time(NULL) + 3;
                             } else if (game_state == GAME_LOBBY) {
                                 me_ready = false;
                                 last_winner_id = ID_UNKNOWN;
                                 match_winner_observed = false;
                                 notif_clear();
+                                client_bombs_clear();
                                 for (int k = 1; k <= MAX_PLAYERS; k++) {
                                     if (players[k].active) {
                                         players[k].alive = true;
@@ -1463,9 +1538,13 @@ int main(int argc, char *argv[]) {
                             if (avail < total) {
                                 goto stop;
                             }
-                            size_t copy = elen < sizeof(status) - 1 ? elen : sizeof(status) - 1;
-                            snprintf(status, sizeof(status), "%.*s", (int)copy, (const char *)(buf + off + sizeof(msg_generic_t) + 2));
-                            had_error = true;
+                            const char *etext = (const char *)(buf + off + sizeof(msg_generic_t) + 2);
+                            bool is_blocked = (elen == 7 && memcmp(etext, "Blocked", 7) == 0);
+                            if (!is_blocked) {
+                                size_t copy = elen < sizeof(status) - 1 ? elen : sizeof(status) - 1;
+                                snprintf(status, sizeof(status), "%.*s", (int)copy, etext);
+                                had_error = true;
+                            }
                             consumed = total;
                             break;
                         }
@@ -1515,7 +1594,9 @@ int main(int argc, char *argv[]) {
                                 level_config_free(&level_cfg);
                                 level_cfg = tmp;
                                 level_cfg_loaded = true;
-                                snprintf(status, sizeof(status), "Map ready (press [m])");
+                                if (game_state != GAME_RUNNING) {
+                                    snprintf(status, sizeof(status), "Map ready (press [m])");
+                                }
                             } else {
                                 free(tmp.cells);
                                 snprintf(status, sizeof(status), "MAP parse error");
@@ -1589,6 +1670,11 @@ int main(int argc, char *argv[]) {
                                     cell_t *cl = level_cell_at(&level_cfg, r, c);
                                     cl->type = CELL_BOMB;
                                     cl->player_id = b->player_id;
+                                    uint16_t total = (b->player_id >= 1 && b->player_id <= MAX_PLAYERS &&
+                                                      players[b->player_id].bomb_timer_ticks > 0)
+                                                         ? players[b->player_id].bomb_timer_ticks
+                                                         : DEFAULT_BOMB_TIMER_TICKS;
+                                    client_bomb_add(r, c, total);
                                 }
                             }
                             consumed = sizeof(msg_bomb_t);
@@ -1606,6 +1692,7 @@ int main(int argc, char *argv[]) {
                                 int br = (int)br16, bc = (int)bc16;
                                 cell_t *cell0 = level_cell_at(&level_cfg, br, bc);
                                 cell0->type = CELL_EXPLOSION;
+                                client_bomb_remove_at((uint16_t)br, (uint16_t)bc);
                                 static const uint8_t dirs[] = {
                                     DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
                                 for (int d = 0; d < 4; d++) {
@@ -1844,6 +1931,13 @@ int main(int argc, char *argv[]) {
                         }
                     }
                 }
+            }
+
+            if (status_expire_at != 0 && time(NULL) >= status_expire_at) {
+                if (strcmp(status, "Match started!") == 0) {
+                    status[0] = '\0';
+                }
+                status_expire_at = 0;
             }
 
             draw_ui(host, port, player_name, status);
