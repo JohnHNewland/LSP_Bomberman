@@ -65,7 +65,7 @@ static bool level_cfg_loaded = false;
 static uint8_t my_player_id = ID_UNKNOWN;
 /* True only when we received a WINNER message in the current session for
  * the current GAME_END. Used to suppress the end-of-match popup on a
- * fresh reconnect into a stale GAME_END state — the rejoining player
+ * fresh reconnect into a stale GAME_END state - the rejoining player
  * didn't participate, so we shouldn't claim anyone "won". */
 static bool    match_winner_observed = false;
 static bool me_ready = false;
@@ -75,6 +75,7 @@ static uint8_t last_winner_id = ID_UNKNOWN;
 typedef struct {
     bool     active;
     bool     alive;
+    bool     ready;
     uint16_t row;
     uint16_t col;
     uint8_t  bomb_count;
@@ -561,7 +562,7 @@ static void cell_glyphs(const cell_t *cell, int r, int c,
         case CELL_BOMB:
             /* Bomb shares the black floor background, so without a glyph
              * the red-on-black colour pair would render as plain black
-             * spaces — invisible. Centre a single 'o' to mark the cell. */
+             * spaces - invisible. Centre a single 'o' to mark the cell. */
             *pair = PAIR_BOMB;
             *attr = A_BOLD;
             top[1] = 'o';
@@ -605,6 +606,70 @@ static void draw_cell(int y, int x, const cell_t *cell, int r, int c) {
     mvaddstr(y,     x, top);
     mvaddstr(y + 1, x, bot);
     attroff(COLOR_PAIR(pair) | attr);
+}
+
+/* Render the players table in the left UI column. Returns the next free
+ * y. Layout adapts to game state:
+ *   - Lobby:       ID  Name             Ready
+ *   - Running/End: ID  Name             St    B  R  S  F
+ * Local player gets a "*" marker and is colour-paired by their id. Hides
+ * itself silently if there's no vertical room. */
+static int draw_player_table(int x, int y, int max_y) {
+    if (y + 3 >= max_y) return y;
+
+    attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
+    mvaddstr(y++, x, "Players");
+    attroff(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
+
+    bool in_match = (game_state == GAME_RUNNING || game_state == GAME_END);
+
+    attron(COLOR_PAIR(PAIR_NORMAL) | A_DIM);
+    if (in_match) {
+        mvaddstr(y++, x, "    ID  Name           St    B  R  S   F");
+    } else {
+        mvaddstr(y++, x, "    ID  Name           Ready");
+    }
+    attroff(COLOR_PAIR(PAIR_NORMAL) | A_DIM);
+
+    for (int i = 1; i <= MAX_PLAYERS && y < max_y - 1; i++) {
+        if (!players[i].active) continue;
+        const client_player_t *p = &players[i];
+        const char *name = p->name[0] ? p->name : "?";
+        bool is_me = ((uint8_t)i == my_player_id);
+        int pair = player_pair((uint8_t)i);
+
+        if (is_me) {
+            attron(COLOR_PAIR(pair) | A_BOLD);
+            mvaddstr(y, x, " >  ");
+            attroff(COLOR_PAIR(pair) | A_BOLD);
+        } else {
+            mvaddstr(y, x, "    ");
+        }
+
+        attron(COLOR_PAIR(pair) | A_BOLD);
+        if (in_match) {
+            const char *st = p->alive ? "OK  " : "DEAD";
+            if (p->alive) {
+                mvprintw(y, x + 4,
+                         "P%-2u %-14.14s %-4s %2u %2u %2u %3u",
+                         (unsigned)i, name, st,
+                         p->bomb_count, p->bomb_radius,
+                         p->speed, p->bomb_timer_ticks);
+            } else {
+                mvprintw(y, x + 4,
+                         "P%-2u %-14.14s %-4s  -  -  -   -",
+                         (unsigned)i, name, st);
+            }
+        } else {
+            const char *st = p->ready ? "READY" : "...";
+            mvprintw(y, x + 4,
+                     "P%-2u %-14.14s %s",
+                     (unsigned)i, name, st);
+        }
+        attroff(COLOR_PAIR(pair) | A_BOLD);
+        y++;
+    }
+    return y;
 }
 
 static void draw_map_picker(void) {
@@ -923,27 +988,8 @@ static void draw_ui(const char *host, int port, const char *player_name,
              game_state == GAME_END     ? "ENDED"   : "LOBBY");
     attroff(COLOR_PAIR(PAIR_NORMAL));
 
-    if ((game_state == GAME_RUNNING || game_state == GAME_END) &&
-        my_player_id >= 1 && my_player_id <= MAX_PLAYERS &&
-        players[my_player_id].active) {
-        const client_player_t *me = &players[my_player_id];
-        int pcolor = player_pair(my_player_id);
-        attron(COLOR_PAIR(pcolor) | A_BOLD);
-        mvprintw(y++, x, " YOU: P%u (%s) ",
-                 my_player_id,
-                 me->alive ? "alive" : "dead - spectating");
-        attroff(COLOR_PAIR(pcolor) | A_BOLD);
-        attron(COLOR_PAIR(PAIR_INFO));
-        mvprintw(y++, x + 2,
-                 "bombs  : %u",   me->bomb_count);
-        mvprintw(y++, x + 2,
-                 "radius : %u",   me->bomb_radius);
-        mvprintw(y++, x + 2,
-                 "speed  : %u",   me->speed);
-        mvprintw(y++, x + 2,
-                 "fuse   : %ut",  me->bomb_timer_ticks);
-        attroff(COLOR_PAIR(PAIR_INFO));
-    }
+    y++;
+    y = draw_player_table(x, y, rows - 1);
 
     if ((game_state == GAME_RUNNING || game_state == GAME_END) &&
         notif_count > 0 && y + 1 < rows - 1) {
@@ -956,13 +1002,18 @@ static void draw_ui(const char *host, int port, const char *player_name,
         int oldest = notif_count - show;
         for (int i = 0; i < show && y < rows - 2; i++) {
             int slot = (oldest + i) % NOTIF_MAX;
-            mvprintw(y++, x, "- %s", notif_buf[slot]);
+            /* Clip so a long event text can't run into the board area. */
+            mvprintw(y++, x, "- %.38s", notif_buf[slot]);
         }
         attroff(COLOR_PAIR(PAIR_NORMAL));
     }
 
     if (game_state == GAME_RUNNING && level_cfg_loaded) {
-        int map_x = 38;
+        /* Pushed out from the original 38 to 44 so the player table and
+         * Events feed in the left column don't get clipped behind the
+         * board. The legend's own visibility guard handles narrow
+         * terminals where 44 + frame_w exceeds the screen. */
+        int map_x = 44;
         int map_y = 3;
         int avail_w = cols - map_x - 4;
         int avail_h = rows - map_y - 3;
@@ -1211,6 +1262,11 @@ int main(int argc, char *argv[]) {
     char status[64] = "connected";
     bool disconnected = false;
     bool welcome_received = false;
+    /* Sticky flag: set on the first MSG_ERROR so a subsequent
+     * MSG_DISCONNECT (the server's polite "I'm closing you" follow-up)
+     * doesn't clobber the actual reason in `status` with the generic
+     * "server requested disconnect" string. */
+    bool had_error = false;
     time_t hello_sent_at  = time(NULL);
     time_t last_recv_at   = hello_sent_at;
     /* When non-zero, time we sent a PING that hasn't been answered by any
@@ -1249,6 +1305,7 @@ int main(int argc, char *argv[]) {
                             my_player_id <= MAX_PLAYERS) {
                             players[my_player_id].active = true;
                             players[my_player_id].alive  = true;
+                            players[my_player_id].ready  = me_ready;
                             snprintf(players[my_player_id].name,
                                      sizeof(players[my_player_id].name),
                                      "%s", player_name);
@@ -1261,6 +1318,7 @@ int main(int argc, char *argv[]) {
                             if (id >= 1 && id <= MAX_PLAYERS) {
                                 players[id].active = true;
                                 players[id].alive  = true;
+                                players[id].ready  = oc[k].ready ? true : false;
                                 memcpy(players[id].name, oc[k].name,
                                        PLAYER_NAME_LEN);
                                 players[id].name[PLAYER_NAME_LEN] = '\0';
@@ -1276,7 +1334,7 @@ int main(int argc, char *argv[]) {
                             (const msg_hello_t *)(buf + off);
                         uint8_t id = hdr->sender_id;
                         if (id >= 1 && id <= MAX_PLAYERS) {
-                            /* HELLO may be for a freshly reused ID — wipe
+                            /* HELLO may be for a freshly reused ID - wipe
                              * the previous occupant's cached stats so we
                              * don't render stale loadout/position until
                              * the next SYNC_BOARD arrives. */
@@ -1300,8 +1358,10 @@ int main(int argc, char *argv[]) {
                             match_winner_observed = false;
                             notif_clear();
                             for (int k = 1; k <= MAX_PLAYERS; k++) {
-                                if (players[k].active)
+                                if (players[k].active) {
                                     players[k].alive = true;
+                                    players[k].ready = false;
+                                }
                             }
                             snprintf(status, sizeof(status),
                                      "Match started!");
@@ -1311,8 +1371,10 @@ int main(int argc, char *argv[]) {
                             match_winner_observed = false;
                             notif_clear();
                             for (int k = 1; k <= MAX_PLAYERS; k++) {
-                                if (players[k].active)
+                                if (players[k].active) {
                                     players[k].alive = true;
+                                    players[k].ready = false;
+                                }
                             }
                             snprintf(status, sizeof(status),
                                      "Back to lobby");
@@ -1323,10 +1385,15 @@ int main(int argc, char *argv[]) {
                         consumed = sizeof(msg_set_status_t);
                         break;
                     }
-                    case MSG_SET_READY:
-                        if (hdr->sender_id == my_player_id) me_ready = true;
+                    case MSG_SET_READY: {
+                        uint8_t id = hdr->sender_id;
+                        if (id >= 1 && id <= MAX_PLAYERS) {
+                            players[id].ready = true;
+                        }
+                        if (id == my_player_id) me_ready = true;
                         consumed = sizeof(msg_generic_t);
                         break;
+                    }
                     case MSG_PING:
                         send_pong(sock_fd);
                         consumed = sizeof(msg_generic_t);
@@ -1336,8 +1403,13 @@ int main(int argc, char *argv[]) {
                         break;
                     case MSG_DISCONNECT:
                         disconnected = true;
-                        snprintf(status, sizeof(status),
-                                 "server requested disconnect");
+                        /* Preserve any ERROR reason the server already sent
+                         * (e.g. "Server full - match in progress"); only
+                         * fall back to a generic message if there isn't one. */
+                        if (!had_error) {
+                            snprintf(status, sizeof(status),
+                                     "server requested disconnect");
+                        }
                         consumed = sizeof(msg_generic_t);
                         break;
                     case MSG_LEAVE: {
@@ -1362,6 +1434,7 @@ int main(int argc, char *argv[]) {
                                  "%.*s", (int)copy,
                                  (const char *)(buf + off +
                                                 sizeof(msg_generic_t) + 2));
+                        had_error = true;
                         consumed = total;
                         break;
                     }
@@ -1395,7 +1468,7 @@ int main(int argc, char *argv[]) {
                         if (ok) {
                             /* Only seed positions from start cells before
                              * the match begins. Once the game is running,
-                             * SYNC_BOARDs are authoritative — touching
+                             * SYNC_BOARDs are authoritative - touching
                              * row/col here would snap everyone to spawn
                              * for one frame whenever a fresh MAP arrives
                              * (e.g. via SYNC_REQUEST recovery). */
@@ -1739,10 +1812,20 @@ int main(int argc, char *argv[]) {
             stop: ;
         } else if (n == 0) {
             disconnected = true;
-            snprintf(status, sizeof(status), "server closed connection");
+            /* If the server already explained itself via ERROR (e.g.
+             * "Server full - match in progress"), keep that text - the
+             * EOF we're seeing now is just the client closing its end
+             * after the explanatory disconnect. */
+            if (!had_error) {
+                snprintf(status, sizeof(status),
+                         "server closed connection");
+            }
         } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             disconnected = true;
-            snprintf(status, sizeof(status), "recv error: %s", strerror(errno));
+            if (!had_error) {
+                snprintf(status, sizeof(status),
+                         "recv error: %s", strerror(errno));
+            }
         }
 
         if (!disconnected) {
@@ -1750,16 +1833,20 @@ int main(int argc, char *argv[]) {
             if (!welcome_received &&
                 now - hello_sent_at > WELCOME_TIMEOUT_SEC) {
                 disconnected = true;
-                snprintf(status, sizeof(status),
-                         "no WELCOME within %ds - giving up",
-                         WELCOME_TIMEOUT_SEC);
+                if (!had_error) {
+                    snprintf(status, sizeof(status),
+                             "no WELCOME within %ds - giving up",
+                             WELCOME_TIMEOUT_SEC);
+                }
             } else if (welcome_received) {
                 if (pong_pending_since != 0 &&
                     now - pong_pending_since > PONG_TIMEOUT_SEC) {
                     disconnected = true;
-                    snprintf(status, sizeof(status),
-                             "no PONG within %ds - peer timeout",
-                             PONG_TIMEOUT_SEC);
+                    if (!had_error) {
+                        snprintf(status, sizeof(status),
+                                 "no PONG within %ds - peer timeout",
+                                 PONG_TIMEOUT_SEC);
+                    }
                 } else if (pong_pending_since == 0 &&
                            now - last_recv_at > IDLE_BEFORE_PING_SEC) {
                     if (send_ping(sock_fd) == 0) {
@@ -1885,7 +1972,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (sock_fd != -1) {
-        /* Voluntary close — let the server know we're going. */
+        /* Voluntary close - let the server know we're going. */
         send_leave(sock_fd);
         close(sock_fd);
         sock_fd = -1;

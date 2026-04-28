@@ -38,7 +38,7 @@ typedef struct {
     /* When non-zero, holds the time we sent a PING that has not yet been
      * answered by any incoming traffic. Cleared on every read. Per
      * protokols.docx, no PONG within 30 s of a PING is the only timeout
-     * condition — silence alone is not. */
+     * condition - silence alone is not. */
     time_t   pong_pending_since;
 } client_t;
 
@@ -338,7 +338,7 @@ static void detonate_bomb(int idx) {
 
     /* Mark the bomb's own cell as a danger zone for the duration of the
      * explosion so a player walking onto it (or already standing on it)
-     * dies — see MOVE_ATTEMPT's CELL_EXPLOSION check. */
+     * dies - see MOVE_ATTEMPT's CELL_EXPLOSION check. */
     cell_t *cell = level_cell_at(&level_cfg, b.row, b.col);
     cell->type = CELL_EXPLOSION;
     cell->player_id = 0;
@@ -519,6 +519,23 @@ static void check_game_end(void) {
     if (alive <= 1) end_game(alive == 1 ? winner : ID_UNKNOWN);
 }
 
+/* Wipe all room state when the last client leaves so the next person to
+ * connect lands in a fresh empty lobby - no leftover map, no in-progress
+ * match, no bombs/explosions ticking. The leader who reconnects must
+ * pick a map again from the server's maps/ folder. */
+static void reset_server_to_empty(void) {
+    log_msg("Server empty - resetting room (no map, lobby).");
+    current_game_state = GAME_LOBBY;
+    last_winner_id = ID_UNKNOWN;
+    for (int i = 0; i < MAX_BOMBS; i++) bombs[i].active = false;
+    for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
+    if (level_cfg_loaded) {
+        level_config_free(&level_cfg);
+        level_config_free(&level_cfg_pristine);
+        level_cfg_loaded = false;
+    }
+}
+
 static void return_to_lobby(void) {
     if (current_game_state == GAME_LOBBY) return;
     current_game_state = GAME_LOBBY;
@@ -547,7 +564,7 @@ static void check_match_start(void) {
     }
     if (ready_count != active_clients_count) return;
 
-    /* Refuse to enter RUNNING without a level — clients would otherwise
+    /* Refuse to enter RUNNING without a level - clients would otherwise
      * receive SET_STATUS=1 and immediately go off the rails since they
      * have no map. The host needs to load a level first. */
     if (!level_cfg_loaded) {
@@ -707,7 +724,7 @@ static void compute_start_positions(int starts[LEVEL_MAX_PLAYERS + 1]) {
 /* Pick the lowest player ID (1..LEVEL_MAX_PLAYERS) that is free among the
  * currently connected clients. With a level loaded, restrict the choice
  * to IDs that actually have a start cell on that map. Returns 0 if no
- * slot is available — caller should refuse the connection. */
+ * slot is available - caller should refuse the connection. */
 static uint8_t pick_free_player_id(void) {
     bool taken[LEVEL_MAX_PLAYERS + 2] = {false};
     for (int i = 0; i < active_clients_count; i++) {
@@ -745,7 +762,7 @@ static void apply_start_defaults(player_t *p, int idx) {
 
 /* Place every existing client at the start cell that matches their
  * already-assigned p.id. Used at game start, on level load, and on
- * return-to-lobby. Never modifies p.id — IDs are stable for the life of
+ * return-to-lobby. Never modifies p.id - IDs are stable for the life of
  * the connection. */
 static void place_players_at_starts(void) {
     if (!level_cfg_loaded) return;
@@ -914,15 +931,15 @@ void reset_client_data(int index) {
 
 /* Wire-byte length of a message of the given type, given the bytes we
  * have buffered so far (avail). Returns:
- *   > 0 — the full length of the message; caller should slice that many
+ *   > 0 - the full length of the message; caller should slice that many
  *         bytes off buffer and dispatch them.
- *     0 — not enough buffered yet to know (e.g. variable-length header);
+ *     0 - not enough buffered yet to know (e.g. variable-length header);
  *         caller should wait for more bytes.
- *    -1 — unknown / illegal type.
+ *    -1 - unknown / illegal type.
  */
 static ssize_t msg_wire_len(uint8_t type, const char *buf, ssize_t avail) {
     /* Use sizeof on the actual structs so the dispatcher matches what the
-     * peer wrote with `write(fd, &m, sizeof(m))` — including any struct
+     * peer wrote with `write(fd, &m, sizeof(m))` - including any struct
      * padding the compiler inserts (e.g. msg_bomb_attempt_t pads from 5
      * to 6 bytes for uint16_t alignment). */
     switch (type) {
@@ -955,7 +972,7 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
 
     /* Stable per-connection identifier for log lines. The clients[]
      * array compacts when other clients disconnect, so the array index
-     * shifts — we use the assigned player ID instead, which is stable
+     * shifts - we use the assigned player ID instead, which is stable
      * for the entire lifetime of this client's connection. Before
      * HELLO succeeds the player ID is 0; logs in that window omit the
      * prefix. */
@@ -974,11 +991,23 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             memcpy(client_id, buffer + HEADER_LEN, CLIENT_ID_LEN);
             memcpy(player_name, buffer + HEADER_LEN + CLIENT_ID_LEN, PLAYER_NAME_LEN);
 
+            /* No mid-match joins. The room is considered full while a
+             * game is running - late arrivals get a clear "server full"
+             * error and a DISCONNECT so the client returns to the menu
+             * with the message visible. */
+            if (current_game_state == GAME_RUNNING) {
+                send_error(client_fd, ID_UNKNOWN,
+                           "Server full - match in progress");
+                send_disconnect(client_fd, ID_UNKNOWN);
+                log_msg("Rejected join during running match");
+                return -1;
+            }
+
             /* Pick the lowest free player ID (and one that has a start
              * cell on the loaded map, if any). This gives reconnecting /
              * post-match joiners the first vacated slot rather than
              * piling up at active_clients_count + 1. IDs are stable for
-             * the life of the connection — never reshuffled. */
+             * the life of the connection - never reshuffled. */
             uint8_t pid = pick_free_player_id();
             if (pid == 0) {
                 send_error(client_fd, ID_UNKNOWN, "Server full for this map");
@@ -1046,7 +1075,7 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
         }
 
         case MSG_PONG: {
-            /* Heartbeat reply — last_recv_at already refreshed by the
+            /* Heartbeat reply - last_recv_at already refreshed by the
              * read path; nothing else to do. */
             return 0;
         }
@@ -1122,9 +1151,16 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
                 send_error(client_fd, clients[client_idx].p.id, "Blocked");
                 return 0;
             }
-            /* Player-on-player collision is intentionally allowed: two
-             * players may share a cell. Clients render the local player on
-             * top so the user always sees their own avatar. */
+            for (int i = 0; i < active_clients_count; i++) {
+                if (i == client_idx) continue;
+                if (clients[i].fd == -1 || !clients[i].p.alive) continue;
+                if (clients[i].p.row == (uint16_t)nr &&
+                    clients[i].p.col == (uint16_t)nc) {
+                    send_error(client_fd, clients[client_idx].p.id,
+                               "Player there");
+                    return 0;
+                }
+            }
             clients[client_idx].p.row = (uint16_t)nr;
             clients[client_idx].p.col = (uint16_t)nc;
             uint16_t coord = make_cell_index((uint16_t)nr, (uint16_t)nc,
@@ -1154,7 +1190,7 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
                 target->player_id = 0;
                 apply_bonus(&clients[client_idx].p, kind);
                 broadcast_bonus_retrieved(clients[client_idx].p.id, coord);
-                /* Stats changed — refresh clients so HUDs stay accurate. */
+                /* Stats changed - refresh clients so HUDs stay accurate. */
                 broadcast_sync_board_for(&clients[client_idx].p);
                 log_msg("P%u picked up bonus at (%d,%d) (%s)",
                         cn, nr, nc,
@@ -1581,7 +1617,7 @@ int main(int argc, char *argv[]) {
                 if (bytes_read > 0) {
                     clients[i].last_recv_at = time(NULL);
                     clients[i].pong_pending_since = 0;
-                    /* Drain ALL messages in this read — TCP may have
+                    /* Drain ALL messages in this read - TCP may have
                      * coalesced more than one. The previous code only
                      * processed buffer[0] and dropped the rest, which is
                      * what made MAP_LIST_REQUESTs sent right after a
@@ -1660,6 +1696,11 @@ int main(int argc, char *argv[]) {
             }
         }
         active_clients_count = new_active;
+
+        if (active_clients_count == 0 &&
+            (level_cfg_loaded || current_game_state != GAME_LOBBY)) {
+            reset_server_to_empty();
+        }
 
         /* Liveness sweep per protokols.docx: send PING after IDLE seconds
          * of silence; only declare timeout if no reply (or any other
