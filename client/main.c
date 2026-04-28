@@ -660,12 +660,13 @@ static int draw_player_table(int x, int y, int max_y) {
 
     attron(COLOR_PAIR(PAIR_NORMAL) | A_DIM);
     if (in_match) {
-        mvprintw(y++, x, "    %-3s %-14s %-4s %2s %2s %2s %3s", "ID", "Name", "St", "Bm", "Rd", "Sp", "Fu");
+        mvprintw(y++, x, "L   %-3s %-14s %-4s %2s %2s %2s %3s", "ID", "Name", "St", "Bm", "Rd", "Sp", "Fu");
     } else {
-        mvprintw(y++, x, "    %-3s %-14s %s", "ID", "Name", "Ready");
+        mvprintw(y++, x, "L   %-3s %-14s %s", "ID", "Name", "Ready");
     }
     attroff(COLOR_PAIR(PAIR_NORMAL) | A_DIM);
 
+    uint8_t lead = leader_id();
     for (int i = 1; i <= MAX_PLAYERS && y < max_y - 1; i++) {
         if (!players[i].active) {
             continue;
@@ -673,14 +674,21 @@ static int draw_player_table(int x, int y, int max_y) {
         const client_player_t *p = &players[i];
         const char *name = p->name[0] ? p->name : "?";
         bool is_me = ((uint8_t)i == my_player_id);
+        bool is_lead = ((uint8_t)i == lead);
         int pair = player_pair((uint8_t)i);
 
-        if (is_me) {
+        char gutter[5];
+        gutter[0] = is_lead ? '*' : ' ';
+        gutter[1] = is_me   ? '>' : ' ';
+        gutter[2] = ' ';
+        gutter[3] = ' ';
+        gutter[4] = '\0';
+        if (is_me || is_lead) {
             attron(COLOR_PAIR(pair) | A_BOLD);
-            mvaddstr(y, x, " >  ");
+            mvaddstr(y, x, gutter);
             attroff(COLOR_PAIR(pair) | A_BOLD);
         } else {
-            mvaddstr(y, x, "    ");
+            mvaddstr(y, x, gutter);
         }
 
         attron(COLOR_PAIR(pair) | A_BOLD);
@@ -1343,6 +1351,9 @@ int main(int argc, char *argv[]) {
                                 players[id].alive  = true;
                                 memcpy(players[id].name, h->player_name, PLAYER_NAME_LEN);
                                 players[id].name[PLAYER_NAME_LEN] = '\0';
+                                if (id != my_player_id) {
+                                    notif_push("%s joined", player_label(id));
+                                }
                             }
                             consumed = sizeof(msg_hello_t);
                             break;
@@ -1421,9 +1432,24 @@ int main(int argc, char *argv[]) {
                             break;
                         case MSG_LEAVE: {
                             uint8_t id = hdr->sender_id;
-                            if (id >= 1 && id <= MAX_PLAYERS) {
+                            if (id >= 1 && id <= MAX_PLAYERS && players[id].active) {
+                                uint8_t prev_leader = leader_id();
+                                char gone_name[MAX_NAME_LEN + 1];
+                                snprintf(gone_name, sizeof(gone_name), "%s", player_label(id));
                                 players[id].active = false;
                                 players[id].alive  = false;
+                                notif_push("%s left", gone_name);
+                                uint8_t new_leader = leader_id();
+                                if (new_leader != prev_leader && new_leader != 0) {
+                                    if (new_leader == my_player_id) {
+                                        snprintf(status, sizeof(status),
+                                                 "%s left - you are now the leader", gone_name);
+                                    } else {
+                                        snprintf(status, sizeof(status),
+                                                 "%s left - %s is now the leader",
+                                                 gone_name, player_label(new_leader));
+                                    }
+                                }
                             }
                             consumed = sizeof(msg_generic_t);
                             break;
@@ -1849,7 +1875,8 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             if (ch == 'q' || ch == 'Q') {
-                cleanup(0);
+                snprintf(status, sizeof(status), "Returning to main menu");
+                disconnected = true;
             } else if ((ch == 'l' || ch == 'L') && game_state == GAME_LOBBY) {
                 if (!welcome_received) {
                     snprintf(status, sizeof(status), "Wait for server WELCOME before sending requests");
