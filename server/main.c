@@ -472,15 +472,6 @@ static int broadcast_winner(uint8_t winner_id) {
     return sent;
 }
 
-static int send_winner_to(int fd, uint8_t target_id, uint8_t winner_id) {
-    msg_winner_t m = {0};
-    m.hdr.msg_type  = MSG_WINNER;
-    m.hdr.sender_id = ID_SERVER;
-    m.hdr.target_id = target_id;
-    m.winner_id     = winner_id;
-    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
-}
-
 static int broadcast_set_status(uint8_t game_status) {
     int sent = 0;
     for (int i = 0; i < active_clients_count; i++) {
@@ -957,7 +948,7 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             memcpy(player_name, buffer + HEADER_LEN + CLIENT_ID_LEN, PLAYER_NAME_LEN);
 
             // Block mid-game joins
-            if (current_game_state == GAME_RUNNING) {
+            if (current_game_state == GAME_RUNNING || current_game_state == GAME_END) {
                 send_error(client_fd, ID_UNKNOWN,
                            "Server full - match in progress");
                 send_disconnect(client_fd, ID_UNKNOWN);
@@ -1006,19 +997,6 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
 
             if (send_welcome(client_fd, pid) == 0) {
                 log_msg("P%u <- WELCOME", pid);
-            }
-            
-            // syncs when a player joins mid-game
-            if (current_game_state == GAME_RUNNING && level_cfg_loaded) {
-                broadcast_sync_board_for(&clients[client_idx].p);
-                send_sync_board_all_to(client_fd, pid);
-                log_msg("P%u <- SYNC_BOARD x%d (mid-match join)", pid, active_clients_count);
-            }
-            // end screen if joined on end screen
-            else if (current_game_state == GAME_END && level_cfg_loaded) {
-                send_sync_board_all_to(client_fd, pid);
-                send_winner_to(client_fd, pid, last_winner_id);
-                log_msg("P%u <- SYNC_BOARD x%d + WINNER=%u (end-screen join)", pid, active_clients_count, last_winner_id);
             }
             return 0;
         }
