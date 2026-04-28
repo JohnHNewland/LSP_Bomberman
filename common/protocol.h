@@ -33,6 +33,9 @@ typedef enum {
     BONUS_SPEED  = 1,
     BONUS_RADIUS = 2,
     BONUS_TIMER  = 3,
+    /* Extends the spec's bonus enum: the spec body lists "+1 bomb" as a valid
+     * bonus and the map syntax uses 'N' for it, but the spec's typedef forgot
+     * to enumerate it. Wire byte for the type field is 4. */
     BONUS_BOMBS  = 4
 } bonus_type_t;
 
@@ -67,9 +70,10 @@ typedef enum {
 } msg_type_t;
 
 typedef struct {
-    uint8_t msg_type;
+    uint8_t msg_type;  // ziņas tips, kas nosaka datu struktūru
     uint8_t sender_id;
-    uint8_t target_id;
+    uint8_t target_id; // adresāta ID. 255=server. 254=broadcast.
+    // payload
 } msg_generic_t;
 
 #define HEADER_LEN ((int)sizeof(msg_generic_t))
@@ -170,7 +174,6 @@ typedef struct {
     uint8_t  bomb_radius;
     uint16_t bomb_timer_ticks;
     uint16_t speed;
-    uint16_t danger_extra_ticks;
 } msg_sync_board_t;
 
 typedef struct {

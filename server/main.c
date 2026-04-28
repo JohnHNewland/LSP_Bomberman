@@ -50,6 +50,11 @@ static client_t clients[MAX_CLIENTS];
 static int active_clients_count = 0;
 static volatile sig_atomic_t running = 1;
 static game_status_t current_game_state = GAME_LOBBY;
+/* Winner of the most recent finished match. ID_UNKNOWN means draw or
+ * never-played. Kept across the GAME_END screen so a HELLO that arrives
+ * mid-end-screen can be answered with WINNER per the spec's WELCOME body
+ * ("ja statuss ir 2, tad serverim vajadzētu nosūtīt WINNER ziņu"). */
+static uint8_t last_winner_id = ID_UNKNOWN;
 
 static level_config_t level_cfg = {0};
 static level_config_t level_cfg_pristine = {0};
@@ -201,7 +206,6 @@ static void fill_sync_board(msg_sync_board_t *m, const player_t *p) {
     m->bomb_radius        = p->bomb_radius;
     m->bomb_timer_ticks   = htons(p->bomb_timer_ticks);
     m->speed              = htons(p->speed);
-    m->danger_extra_ticks = htons(p->danger_extra_ticks);
 }
 
 static int send_sync_board_to(int fd, uint8_t target_id, const player_t *p) {
@@ -418,6 +422,15 @@ static int broadcast_winner(uint8_t winner_id) {
     return sent;
 }
 
+static int send_winner_to(int fd, uint8_t target_id, uint8_t winner_id) {
+    msg_winner_t m = {0};
+    m.hdr.msg_type  = MSG_WINNER;
+    m.hdr.sender_id = ID_SERVER;
+    m.hdr.target_id = target_id;
+    m.winner_id     = winner_id;
+    return (write(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
 static int broadcast_set_status(uint8_t game_status) {
     int sent = 0;
     for (int i = 0; i < active_clients_count; i++) {
@@ -432,6 +445,7 @@ static int broadcast_set_status(uint8_t game_status) {
 static void end_game(uint8_t winner_id) {
     if (current_game_state == GAME_END) return;
     current_game_state = GAME_END;
+    last_winner_id = winner_id;
     for (int i = 0; i < MAX_BOMBS; i++) bombs[i].active = false;
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
     broadcast_set_status(GAME_END);
@@ -459,6 +473,7 @@ static void check_game_end(void) {
 static void return_to_lobby(void) {
     if (current_game_state == GAME_LOBBY) return;
     current_game_state = GAME_LOBBY;
+    last_winner_id = ID_UNKNOWN;
     for (int i = 0; i < MAX_BOMBS; i++) bombs[i].active = false;
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
     for (int i = 0; i < active_clients_count; i++) {
@@ -814,14 +829,20 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
     if (len <= 0) return -1;
     if (len < 1) return -1;
 
-    int cn = client_idx + 1;
+    /* Stable per-connection identifier for log lines. The clients[]
+     * array compacts when other clients disconnect, so the array index
+     * shifts — we use the assigned player ID instead, which is stable
+     * for the entire lifetime of this client's connection. Before
+     * HELLO succeeds the player ID is 0; logs in that window omit the
+     * prefix. */
+    uint8_t cn = clients[client_idx].p.id;
     msg_type_t type = buffer[0];
 
     switch (type) {
         case MSG_HELLO: {
             if (len < HEADER_LEN + CLIENT_ID_LEN + PLAYER_NAME_LEN) {
                 send_error(client_fd, 0xFF, "Malformed HELLO");
-                log_msg("C%d <- ERROR (malformed HELLO)", cn);
+                log_msg("ERROR (malformed HELLO from new client)");
                 return 0;
             }
             char client_id[CLIENT_ID_LEN + 1] = {0};
@@ -844,8 +865,8 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             clients[client_idx].p.id = pid;
             clients[client_idx].p.alive = true;
 
-            log_msg("C%d -> HELLO (id=%s, name=%s) -> player %u",
-                    cn, client_id, clients[client_idx].p.name, pid);
+            log_msg("P%u -> HELLO (id=%s, name=%s)",
+                    pid, client_id, clients[client_idx].p.name);
 
             /* Forward HELLO to other clients so they learn about the new
              * player (per the protocol's "pārsūtāma" property). */
@@ -862,13 +883,13 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             }
 
             if (send_welcome(client_fd, pid) == 0) {
-                log_msg("C%d <- WELCOME (id=%u)", cn, pid);
+                log_msg("P%u <- WELCOME", pid);
             }
 
             if (level_cfg_loaded) {
                 place_one_player_at_start(client_idx);
                 if (send_map_to(client_fd, pid) == 0) {
-                    log_msg("C%d <- MAP (%ux%u)", cn,
+                    log_msg("P%u <- MAP (%ux%u)", pid,
                             level_cfg.rows, level_cfg.cols);
                 }
             }
@@ -879,16 +900,24 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             if (current_game_state == GAME_RUNNING && level_cfg_loaded) {
                 broadcast_sync_board_for(&clients[client_idx].p);
                 send_sync_board_all_to(client_fd, pid);
-                log_msg("C%d <- SYNC_BOARD x%d (mid-match join)",
-                        cn, active_clients_count);
+                log_msg("P%u <- SYNC_BOARD x%d (mid-match join)",
+                        pid, active_clients_count);
+            }
+            /* If the client joined during the end screen, the spec's
+             * WELCOME body says we should also send WINNER (status==2). */
+            else if (current_game_state == GAME_END && level_cfg_loaded) {
+                send_sync_board_all_to(client_fd, pid);
+                send_winner_to(client_fd, pid, last_winner_id);
+                log_msg("P%u <- SYNC_BOARD x%d + WINNER=%u (end-screen join)",
+                        pid, active_clients_count, last_winner_id);
             }
             return 0;
         }
 
         case MSG_PING: {
-            log_msg("C%d -> PING", cn);
+            log_msg("P%u -> PING", cn);
             send_simple(client_fd, MSG_PONG, clients[client_idx].p.id);
-            log_msg("C%d <- PONG", cn);
+            log_msg("P%u <- PONG", cn);
             return 0;
         }
 
@@ -899,12 +928,12 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
         }
 
         case MSG_LEAVE: {
-            log_msg("C%d -> LEAVE", cn);
+            log_msg("P%u -> LEAVE", cn);
             return 0;
         }
 
         case MSG_SET_READY: {
-            log_msg("C%d -> SET_READY", cn);
+            log_msg("P%u -> SET_READY", cn);
             clients[client_idx].p.ready = true;
             broadcast_simple(MSG_SET_READY, clients[client_idx].p.id);
             check_match_start();
@@ -919,7 +948,7 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             }
             const msg_set_status_t *s =
                 (const msg_set_status_t *)buffer;
-            log_msg("C%d -> SET_STATUS %u", cn, s->game_status);
+            log_msg("P%u -> SET_STATUS %u", cn, s->game_status);
             if (s->game_status == GAME_LOBBY &&
                 current_game_state == GAME_END) {
                 return_to_lobby();
@@ -989,6 +1018,13 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             uint16_t coord =
                 (uint16_t)(nr * level_cfg.cols + nc);
             broadcast_moved(clients[client_idx].p.id, coord);
+            /* Walking into a lingering explosion cell (the danger zone
+             * left behind after the initial flash) kills the player. */
+            if (target->type == CELL_EXPLOSION) {
+                kill_players_at((uint16_t)nr, (uint16_t)nc);
+                check_game_end();
+                return 0;
+            }
             if (target->type == CELL_BONUS_SPEED ||
                 target->type == CELL_BONUS_RADIUS ||
                 target->type == CELL_BONUS_TIMER ||
@@ -1000,17 +1036,22 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
                 broadcast_bonus_retrieved(clients[client_idx].p.id, coord);
                 /* Stats changed — refresh clients so HUDs stay accurate. */
                 broadcast_sync_board_for(&clients[client_idx].p);
-                log_msg("C%d picked up bonus at (%d,%d) (%s)",
+                log_msg("P%u picked up bonus at (%d,%d) (%s)",
                         cn, nr, nc,
                         kind == CELL_BONUS_SPEED  ? "speed"  :
                         kind == CELL_BONUS_RADIUS ? "radius" :
                         kind == CELL_BONUS_TIMER  ? "timer"  : "bombs");
             }
-            log_msg("C%d MOVED to (%d,%d)", cn, nr, nc);
+            log_msg("P%u MOVED to (%d,%d)", cn, nr, nc);
             return 0;
         }
 
         case MSG_BOMB_ATTEMPT: {
+            if (len < (ssize_t)sizeof(msg_bomb_attempt_t)) {
+                send_error(client_fd, clients[client_idx].p.id,
+                           "Bad BOMB_ATTEMPT");
+                return 0;
+            }
             if (current_game_state != GAME_RUNNING || !level_cfg_loaded) {
                 send_error(client_fd, clients[client_idx].p.id,
                            "Game not running");
@@ -1019,6 +1060,17 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
             player_t *p = &clients[client_idx].p;
             if (!p->alive) {
                 send_error(client_fd, p->id, "Dead players cannot bomb");
+                return 0;
+            }
+            /* Spec rule: bombs may only be placed on the player's current
+             * cell. Reject explicitly so a client bug surfaces instead of
+             * silently rewriting the cell. */
+            const msg_bomb_attempt_t *ba =
+                (const msg_bomb_attempt_t *)buffer;
+            uint16_t want = ntohs(ba->cell);
+            uint16_t have = make_cell_index(p->row, p->col, level_cfg.cols);
+            if (want != have) {
+                send_error(client_fd, p->id, "Bomb cell != player cell");
                 return 0;
             }
             if (count_bombs_owned(p->id) >= p->bomb_count) {
@@ -1054,24 +1106,24 @@ int process_message(int client_idx, int client_fd, char *buffer, ssize_t len) {
 
             uint16_t coord = (uint16_t)(p->row * level_cfg.cols + p->col);
             broadcast_bomb(p->id, coord);
-            log_msg("C%d -> BOMB at (%u,%u) r=%u t=%u",
+            log_msg("P%u -> BOMB at (%u,%u) r=%u t=%u",
                     cn, p->row, p->col, p->bomb_radius, p->bomb_timer_ticks);
             return 0;
         }
 
         case MSG_SYNC_REQUEST: {
-            log_msg("C%d -> SYNC_REQUEST", cn);
+            log_msg("P%u -> SYNC_REQUEST", cn);
             if (current_game_state == GAME_RUNNING && level_cfg_loaded) {
                 send_map_to(client_fd, clients[client_idx].p.id);
                 send_sync_board_all_to(client_fd, clients[client_idx].p.id);
-                log_msg("C%d <- MAP + SYNC_BOARD x%d (sync)",
+                log_msg("P%u <- MAP + SYNC_BOARD x%d (sync)",
                         cn, active_clients_count);
             }
             return 0;
         }
 
         default:
-            log_msg("C%d -> unknown (type=%d)", cn, (int)type);
+            log_msg("P%u -> unknown (type=%d)", cn, (int)type);
             break;
     }
     return 0;
@@ -1279,8 +1331,7 @@ int main(int argc, char *argv[]) {
                     clients[active_clients_count].last_recv_at = time(NULL);
                     clients[active_clients_count].pong_pending_since = 0;
                     active_clients_count++;
-                    log_msg("Client %d connected (awaiting HELLO).",
-                            active_clients_count);
+                    log_msg("New client connected (awaiting HELLO).");
                 } else {
                     send_disconnect(new_sock, ID_UNKNOWN);
                     close(new_sock);
@@ -1304,10 +1355,13 @@ int main(int argc, char *argv[]) {
                     clients[i].pong_pending_since = 0;
                     process_message(i, sock, buffer, bytes_read);
                 } else if (bytes_read == 0) {
-                    log_msg("Client %d disconnected.", i + 1);
                     uint8_t leaving = clients[i].p.id;
-                    if (leaving != 0)
+                    if (leaving != 0) {
+                        log_msg("P%u disconnected.", leaving);
                         broadcast_simple(MSG_LEAVE, leaving);
+                    } else {
+                        log_msg("Pre-HELLO client disconnected.");
+                    }
                     int j = i;
                     while (j < active_clients_count - 1) {
                         clients[j] = clients[j + 1];
@@ -1318,10 +1372,13 @@ int main(int argc, char *argv[]) {
                     check_game_end();
                     continue;
                 } else {
-                    log_msg("Client %d connection error.", i + 1);
                     uint8_t leaving = clients[i].p.id;
-                    if (leaving != 0)
+                    if (leaving != 0) {
+                        log_msg("P%u connection error.", leaving);
                         broadcast_simple(MSG_LEAVE, leaving);
+                    } else {
+                        log_msg("Pre-HELLO client connection error.");
+                    }
                     close(sock);
                     clients[i].fd = -1;
                     // Logic to handle disconnect in next iteration or immediate removal?
@@ -1362,8 +1419,8 @@ int main(int argc, char *argv[]) {
             time_t silent = now_t - clients[i].last_recv_at;
             if (clients[i].pong_pending_since != 0 &&
                 now_t - clients[i].pong_pending_since > PONG_TIMEOUT_SEC) {
-                log_msg("C%d PONG timeout (%lds since PING) - dropping.",
-                        i + 1,
+                log_msg("P%u PONG timeout (%lds since PING) - dropping.",
+                        clients[i].p.id,
                         (long)(now_t - clients[i].pong_pending_since));
                 send_disconnect(clients[i].fd, clients[i].p.id);
                 if (clients[i].p.id != 0)

@@ -86,7 +86,6 @@ typedef struct {
     uint8_t  bomb_radius;
     uint16_t bomb_timer_ticks;
     uint16_t speed;
-    uint16_t danger_extra_ticks;
     uint8_t  lives;
 } client_player_t;
 
@@ -466,64 +465,58 @@ static void cell_glyphs(const cell_t *cell, int r, int c,
                         int *pair, int *attr,
                         char top[CELL_W + 1], char bot[CELL_W + 1]) {
     (void)r; (void)c;
-    *attr = A_BOLD;
+    /* Default: blank cell, color carries the meaning. Players and
+     * powerups override `top` with a centered glyph so the user can
+     * still tell them apart at a glance. */
+    *pair = PAIR_FLOOR;
+    *attr = 0;
+    memcpy(top, "   ", 4);
+    memcpy(bot, "   ", 4);
     switch (cell->type) {
         case CELL_EMPTY:
-            *pair = PAIR_FLOOR;
             *attr = A_DIM;
-            memcpy(top, "   ", 4);
-            memcpy(bot, "   ", 4);
             break;
         case CELL_HARD_BLOCK:
-            /* Solid block — fg=bg=blue plus spaces gives a clean wall. */
             *pair = PAIR_HARD;
-            *attr = 0;
-            memcpy(top, "   ", 4);
-            memcpy(bot, "   ", 4);
             break;
         case CELL_SOFT_BLOCK:
             *pair = PAIR_SOFT;
-            memcpy(top, "[#]", 4);
-            memcpy(bot, "[#]", 4);
             break;
         case CELL_BOMB:
+            /* Bomb shares the black floor background, so without a glyph
+             * the red-on-black colour pair would render as plain black
+             * spaces — invisible. Centre a single 'o' to mark the cell. */
             *pair = PAIR_BOMB;
-            memcpy(top, " o ", 4);
-            memcpy(bot, "(_)", 4);
-            break;
-        case CELL_PLAYER_START: {
-            *pair = player_pair(cell->player_id);
-            top[0] = ' ';
-            top[1] = (char)('0' + cell->player_id);
-            top[2] = ' ';
-            top[3] = '\0';
-            memcpy(bot, "/V\\", 4);
-            break;
-        }
-        case CELL_BONUS_SPEED:
-            *pair = PAIR_B_SPEED;
-            memcpy(top, " A ", 4);
-            memcpy(bot, ">>>", 4);
-            break;
-        case CELL_BONUS_RADIUS:
-            *pair = PAIR_B_RAD;
-            memcpy(top, " R ", 4);
-            memcpy(bot, "<*>", 4);
-            break;
-        case CELL_BONUS_TIMER:
-            *pair = PAIR_B_TIMER;
-            memcpy(top, " T ", 4);
-            memcpy(bot, "(C)", 4);
-            break;
-        case CELL_BONUS_BOMBS:
-            *pair = PAIR_B_BOMBS;
-            memcpy(top, " N ", 4);
-            memcpy(bot, "+*+", 4);
+            *attr = A_BOLD;
+            top[1] = 'o';
             break;
         case CELL_EXPLOSION:
             *pair = PAIR_EXPL;
-            memcpy(top, "\\|/", 4);
-            memcpy(bot, "/|\\", 4);
+            break;
+        case CELL_PLAYER_START:
+            *pair = player_pair(cell->player_id);
+            *attr = A_BOLD;
+            top[1] = (char)('0' + cell->player_id);
+            break;
+        case CELL_BONUS_SPEED:
+            *pair = PAIR_B_SPEED;
+            *attr = A_BOLD;
+            top[1] = 'A';
+            break;
+        case CELL_BONUS_RADIUS:
+            *pair = PAIR_B_RAD;
+            *attr = A_BOLD;
+            top[1] = 'R';
+            break;
+        case CELL_BONUS_TIMER:
+            *pair = PAIR_B_TIMER;
+            *attr = A_BOLD;
+            top[1] = 'T';
+            break;
+        case CELL_BONUS_BOMBS:
+            *pair = PAIR_B_BOMBS;
+            *attr = A_BOLD;
+            top[1] = 'N';
             break;
     }
 }
@@ -818,7 +811,7 @@ static void edit_name(char *buf, size_t cap) {
 }
 
 static void draw_ui(const char *host, int port, const char *player_name,
-                    const char *last_recv, const char *status) {
+                    const char *status) {
     erase();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -837,22 +830,6 @@ static void draw_ui(const char *host, int port, const char *player_name,
     mvprintw(y + 1, x + 9, "%s", player_name);
     attroff(COLOR_PAIR(PAIR_INFO) | A_BOLD);
     y += 3;
-
-    attron(COLOR_PAIR(PAIR_NORMAL));
-    mvaddstr(y++, x, "Last server message:");
-    attroff(COLOR_PAIR(PAIR_NORMAL));
-
-    attron(COLOR_PAIR(PAIR_INFO));
-    mvprintw(y++, x + 2, "\"%s\"", last_recv);
-    attroff(COLOR_PAIR(PAIR_INFO));
-    y++;
-
-    attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
-    mvaddstr(y, x, "[p]");
-    attroff(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_NORMAL));
-    mvaddstr(y++, x + 4, "Send PING");
-    attroff(COLOR_PAIR(PAIR_NORMAL));
 
     attron(COLOR_PAIR(PAIR_HOTKEY) | A_BOLD);
     mvaddstr(y, x, "[m]");
@@ -911,8 +888,6 @@ static void draw_ui(const char *host, int port, const char *player_name,
                  "speed  : %u",   me->speed);
         mvprintw(y++, x + 2,
                  "fuse   : %ut",  me->bomb_timer_ticks);
-        mvprintw(y++, x + 2,
-                 "linger : +%ut", me->danger_extra_ticks);
         attroff(COLOR_PAIR(PAIR_INFO));
     }
 
@@ -1128,7 +1103,6 @@ int main(int argc, char *argv[]) {
         usleep(20000);
     }
 
-    char last_recv[BUFFER_SIZE] = "(none)";
     char status[64] = "connected";
     bool disconnected = false;
     bool welcome_received = false;
@@ -1160,8 +1134,6 @@ int main(int argc, char *argv[]) {
                         size_t total = sizeof(msg_welcome_t) +
                             (size_t)w->length * sizeof(msg_other_client_t);
                         if (avail < total) goto stop;
-                        char sid[SERVER_ID_LEN + 1] = {0};
-                        memcpy(sid, w->server_id, SERVER_ID_LEN);
                         my_player_id = hdr->sender_id;
                         game_state = (game_status_t)w->game_status;
                         /* New session: forget any winner from a prior
@@ -1183,10 +1155,6 @@ int main(int argc, char *argv[]) {
                                 players[id].alive  = true;
                             }
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "WELCOME id=%u status=%u others=%u srv=%s",
-                                 my_player_id, w->game_status,
-                                 w->length, sid);
                         welcome_received = true;
                         consumed = total;
                         break;
@@ -1203,8 +1171,6 @@ int main(int argc, char *argv[]) {
                             players[id].active = true;
                             players[id].alive  = true;
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "HELLO id=%u joined", id);
                         consumed = sizeof(msg_hello_t);
                         break;
                     }
@@ -1213,8 +1179,6 @@ int main(int argc, char *argv[]) {
                         const msg_set_status_t *s =
                             (const msg_set_status_t *)(buf + off);
                         game_state = (game_status_t)s->game_status;
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "SET_STATUS = %u", s->game_status);
                         if (game_state == GAME_RUNNING) {
                             last_winner_id = ID_UNKNOWN;
                             match_winner_observed = false;
@@ -1242,24 +1206,17 @@ int main(int argc, char *argv[]) {
                         break;
                     }
                     case MSG_SET_READY:
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "SET_READY id=%u", hdr->sender_id);
                         if (hdr->sender_id == my_player_id) me_ready = true;
                         consumed = sizeof(msg_generic_t);
                         break;
                     case MSG_PING:
                         send_pong(sock_fd);
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "PING from server -> PONG");
                         consumed = sizeof(msg_generic_t);
                         break;
                     case MSG_PONG:
-                        snprintf(last_recv, sizeof(last_recv), "PONG");
                         consumed = sizeof(msg_generic_t);
                         break;
                     case MSG_DISCONNECT:
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "DISCONNECT from server");
                         disconnected = true;
                         snprintf(status, sizeof(status),
                                  "server requested disconnect");
@@ -1271,8 +1228,6 @@ int main(int argc, char *argv[]) {
                             players[id].active = false;
                             players[id].alive  = false;
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "LEAVE id=%u", id);
                         consumed = sizeof(msg_generic_t);
                         break;
                     }
@@ -1283,10 +1238,10 @@ int main(int argc, char *argv[]) {
                             (buf + off)[sizeof(msg_generic_t) + 1];
                         size_t total = sizeof(msg_generic_t) + 2 + elen;
                         if (avail < total) goto stop;
-                        size_t copy = elen < sizeof(last_recv) - 16
-                                      ? elen : sizeof(last_recv) - 16;
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "ERROR: %.*s", (int)copy,
+                        size_t copy = elen < sizeof(status) - 1
+                                      ? elen : sizeof(status) - 1;
+                        snprintf(status, sizeof(status),
+                                 "%.*s", (int)copy,
                                  (const char *)(buf + off +
                                                 sizeof(msg_generic_t) + 2));
                         consumed = total;
@@ -1320,10 +1275,19 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         if (ok) {
+                            /* Only seed positions from start cells before
+                             * the match begins. Once the game is running,
+                             * SYNC_BOARDs are authoritative — touching
+                             * row/col here would snap everyone to spawn
+                             * for one frame whenever a fresh MAP arrives
+                             * (e.g. via SYNC_REQUEST recovery). */
+                            bool seed_positions =
+                                (game_state != GAME_RUNNING);
                             for (size_t i = 0; i < need; i++) {
                                 if (tmp.cells[i].type == CELL_PLAYER_START) {
                                     uint8_t pid = tmp.cells[i].player_id;
-                                    if (pid >= 1 && pid <= MAX_PLAYERS &&
+                                    if (seed_positions &&
+                                        pid >= 1 && pid <= MAX_PLAYERS &&
                                         players[pid].active) {
                                         players[pid].row =
                                             (uint16_t)(i / m->W);
@@ -1338,10 +1302,8 @@ int main(int argc, char *argv[]) {
                             level_config_free(&level_cfg);
                             level_cfg = tmp;
                             level_cfg_loaded = true;
-                            snprintf(last_recv, sizeof(last_recv),
-                                     "MAP %ux%u from server", m->H, m->W);
                             snprintf(status, sizeof(status),
-                                     "MAP received (press [m])");
+                                     "Map ready (press [m])");
                         } else {
                             free(tmp.cells);
                             snprintf(status, sizeof(status),
@@ -1365,9 +1327,6 @@ int main(int argc, char *argv[]) {
                             players[mv->player_id].col =
                                 coord % level_cfg.cols;
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "MOVED id=%u -> %u",
-                                 mv->player_id, coord);
                         consumed = sizeof(msg_moved_t);
                         break;
                     }
@@ -1383,8 +1342,6 @@ int main(int argc, char *argv[]) {
                             snprintf(status, sizeof(status),
                                      "You died!");
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "DEATH id=%u", d->player_id);
                         consumed = sizeof(msg_death_t);
                         break;
                     }
@@ -1394,8 +1351,6 @@ int main(int argc, char *argv[]) {
                             (const msg_winner_t *)(buf + off);
                         last_winner_id = w->winner_id;
                         match_winner_observed = true;
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "WINNER id=%u", w->winner_id);
                         if (w->winner_id == ID_UNKNOWN) {
                             snprintf(status, sizeof(status),
                                      "Draw - no survivors");
@@ -1424,9 +1379,6 @@ int main(int argc, char *argv[]) {
                                 cl->player_id = b->player_id;
                             }
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "BOMB id=%u @ %u",
-                                 b->player_id, coord);
                         consumed = sizeof(msg_bomb_t);
                         break;
                     }
@@ -1461,8 +1413,6 @@ int main(int argc, char *argv[]) {
                                 }
                             }
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "BOOM r=%u @ %u", e->radius, coord);
                         consumed = sizeof(msg_explosion_t);
                         break;
                     }
@@ -1516,8 +1466,6 @@ int main(int argc, char *argv[]) {
                                 }
                             }
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "BLOCK_DESTROYED @ %u", coord);
                         consumed = sizeof(msg_block_destroyed_t);
                         break;
                     }
@@ -1563,14 +1511,7 @@ int main(int argc, char *argv[]) {
                             players[pid].bomb_radius        = sb->bomb_radius;
                             players[pid].bomb_timer_ticks   = ntohs(sb->bomb_timer_ticks);
                             players[pid].speed              = ntohs(sb->speed);
-                            players[pid].danger_extra_ticks = ntohs(sb->danger_extra_ticks);
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "SYNC_BOARD id=%u @(%u,%u) %s lives=%u",
-                                 pid,
-                                 players[pid].row, players[pid].col,
-                                 sb->alive ? "alive" : "dead",
-                                 sb->lives);
                         consumed = sizeof(msg_sync_board_t);
                         break;
                     }
@@ -1589,15 +1530,10 @@ int main(int argc, char *argv[]) {
                                 cl->player_id = 0;
                             }
                         }
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "BONUS picked id=%u @ %u",
-                                 br->player_id, coord);
                         consumed = sizeof(msg_bonus_retrieved_t);
                         break;
                     }
                     default:
-                        snprintf(last_recv, sizeof(last_recv),
-                                 "msg type=%u", hdr->msg_type);
                         consumed = sizeof(msg_generic_t);
                         break;
                 }
@@ -1637,24 +1573,11 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        draw_ui(host, port, player_name, last_recv, status);
+        draw_ui(host, port, player_name, status);
 
         int ch = getch();
         if (ch == 'q' || ch == 'Q') {
             cleanup(0);
-        } else if (ch == 'p' || ch == 'P') {
-            if (send_ping(sock_fd) == 0) {
-                if (pong_pending_since == 0)
-                    pong_pending_since = time(NULL);
-                snprintf(status, sizeof(status), "PING sent");
-            } else {
-                snprintf(status, sizeof(status),
-                         "PING failed: %s", strerror(errno));
-                if (errno == EPIPE || errno == ECONNRESET ||
-                    errno == EBADF  || errno == ENOTCONN) {
-                    disconnected = true;
-                }
-            }
         } else if (ch == 'm' || ch == 'M') {
             if (level_cfg_loaded) {
                 preview_level();
