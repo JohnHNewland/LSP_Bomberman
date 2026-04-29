@@ -23,7 +23,7 @@
 #include "../common/protocol.h"
 
 #define DEFAULT_HOST "0.0.0.0"
-#define DEFAULT_PORT 7890
+#define DEFAULT_PORT 22032
 #define BUFFER_SIZE 8192
 #define MAX_CLIENTS 16
 
